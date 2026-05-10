@@ -44,7 +44,7 @@ from _prefill_hook import (
     PrefillConfig, add_cli_flags, config_from_args,
     compress_text_via_daemon,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
 
@@ -162,14 +162,18 @@ class ToolDef(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     model: str = MODEL_NAME
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = 512
+    # OpenAI-compatible alias (newer clients send this instead of max_tokens).
+    max_completion_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     tools: list[ToolDef] | None = None
-    tool_choice: Any | None = None  # "auto" | "none" | {"function": {...}}
+    tool_choice: Any | None = None  # "auto" | "none" | {"type":"function",...} | {"type":"required"}
     chat_template_kwargs: dict | None = None  # e.g. {"enable_thinking": false}
     stop: Any | None = None  # str or list[str]
     stream_options: dict | None = None  # e.g. {"include_usage": true}
@@ -578,6 +582,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         kwargs = dict(tokenize=False, add_generation_prompt=True)
         if tools_arg:
             kwargs["tools"] = tools_arg
+        if req.tool_choice is not None:
+            kwargs["tool_choice"] = req.tool_choice
         # Per-request chat template knobs (e.g. enable_thinking, preserve_thinking).
         if req.chat_template_kwargs:
             kwargs.update(req.chat_template_kwargs)
@@ -616,6 +622,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     async def _drain_pipe_to_sentinel():
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: list(_token_stream(r_pipe, 0)))
+
+    def _max_gen_tokens(req: ChatRequest) -> int:
+        if req.max_completion_tokens is not None:
+            return req.max_completion_tokens
+        return req.max_tokens
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
@@ -664,7 +675,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cur_ids = prompt_ids
 
         available_gen = max_ctx - prompt_len - 20
-        gen_len = min(req.max_tokens, available_gen)
+        gen_len = min(_max_gen_tokens(req), available_gen)
         if gen_len <= 0:
             if full_hit is None:
                 try: cur_bin.unlink()
