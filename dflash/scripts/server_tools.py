@@ -30,6 +30,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -43,7 +44,7 @@ from _prefill_hook import (
     PrefillConfig, add_cli_flags, config_from_args,
     compress_text_via_daemon,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
 
@@ -56,9 +57,76 @@ DEFAULT_TARGET = Path(os.environ.get(
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 ))
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
-DEFAULT_BIN = ROOT / "build" / "test_dflash"
+DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
+
+
+def _extra_daemon_has_target_sharding(extra: list[str] | None) -> bool:
+    """True if we spawn test_dflash with multi-GPU target layer split."""
+    if not extra:
+        return False
+    return any(tok.startswith("--target-gpus") for tok in extra)
+
+
+# Architecture strings in `general.architecture` of the GGUF (see server.py).
+_QWEN35_ARCHES = {"qwen35", "qwen36"}
+_LAGUNA_ARCHES = {"laguna"}
+
+_QWEN35_FAMILY_TOKENIZERS = {
+    "Qwen3.5-27B": "Qwen/Qwen3.5-27B",
+    "Qwen3.6-27B": "Qwen/Qwen3.6-27B",
+}
+_LAGUNA_FAMILY_TOKENIZERS = {
+    "Laguna-XS.2": "poolside/Laguna-XS.2",
+    "Laguna-XS":   "poolside/Laguna-XS.2",
+    "laguna-xs2":  "poolside/Laguna-XS.2",
+}
+
+
+def _read_gguf_str(reader, key: str) -> str | None:
+    f = reader.fields.get(key)
+    if f is None or not f.data:
+        return None
+    import numpy as np
+    p = f.parts[f.data[0]]
+    if not isinstance(p, np.ndarray):
+        return None
+    try:
+        return bytes(p).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _arch_from_gguf(gguf_path: Path) -> str:
+    try:
+        from gguf import GGUFReader  # type: ignore
+        r = GGUFReader(str(gguf_path))
+        v = _read_gguf_str(r, "general.architecture")
+        return v.lower() if v else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
+    default = "Qwen/Qwen3.5-27B"
+    try:
+        from gguf import GGUFReader  # type: ignore
+        r = GGUFReader(str(gguf_path))
+        arch = (_read_gguf_str(r, "general.architecture") or "").lower()
+        family = _LAGUNA_FAMILY_TOKENIZERS if arch in _LAGUNA_ARCHES else _QWEN35_FAMILY_TOKENIZERS
+        if arch in _LAGUNA_ARCHES:
+            default = next(iter(_LAGUNA_FAMILY_TOKENIZERS.values()))
+        for key in ("general.basename", "general.name"):
+            val = _read_gguf_str(r, key)
+            if val is None:
+                continue
+            for known, repo in family.items():
+                if known.lower() in val.lower():
+                    return repo
+    except Exception:
+        pass
+    return default
 
 
 def resolve_draft(root: Path) -> Path:
@@ -315,23 +383,62 @@ def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
 
 # ─── app ───────────────────────────────────────────────────────────
 
-def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
+def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
               max_ctx: int, tokenizer: AutoTokenizer, stop_ids: set[int],
               prefill_cfg: PrefillConfig | None = None,
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
-              prefill_cache_slots: int = 4) -> FastAPI:
+              prefill_cache_slots: int = 4,
+              arch: str = "qwen35",
+              extra_daemon_args: list[str] | None = None) -> FastAPI:
     import asyncio
+    if _extra_daemon_has_target_sharding(extra_daemon_args):
+        if prefix_cache_slots > 0 or prefill_cache_slots > 0:
+            print(
+                "  [cfg] target-gpus sharding: disabling prefix/full cache "
+                "(daemon SNAPSHOT/RESTORE not implemented for this mode)",
+                flush=True,
+            )
+            prefix_cache_slots = 0
+            prefill_cache_slots = 0
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = asyncio.Lock()
 
     r_pipe, w_pipe = os.pipe()
-    cmd = [str(bin_path), str(target), str(draft), "--daemon",
-           "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-           f"--max-ctx={max_ctx}",
-           f"--stream-fd={w_pipe}"]
-    daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, bufsize=0)
+    if sys.platform == "win32":
+        import msvcrt
+        os.set_inheritable(w_pipe, True)
+        stream_fd_val = int(msvcrt.get_osfhandle(w_pipe))
+    else:
+        stream_fd_val = w_pipe
+
+    bin_abs = str(Path(bin_path).resolve())
+    dll_dir = str(Path(bin_abs).parent / "bin")
+    env = {**os.environ}
+    if sys.platform == "win32":
+        env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
+
+    if arch in _LAGUNA_ARCHES:
+        cmd = [bin_abs, str(target), "--daemon",
+               f"--max-ctx={max_ctx}",
+               f"--stream-fd={stream_fd_val}"]
+    else:
+        if draft is None:
+            raise SystemExit("qwen35 arch requires --draft model.safetensors")
+        cmd = [bin_abs, str(target), str(draft), "--daemon",
+               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
+               f"--max-ctx={max_ctx}",
+               f"--stream-fd={stream_fd_val}"]
+        if extra_daemon_args:
+            cmd.extend(extra_daemon_args)
+    if sys.platform == "win32":
+        daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
+                                       stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, bufsize=0)
+    else:
+        daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), env=env,
+                                       stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, bufsize=0)
     os.close(w_pipe)
 
     bus = DaemonStdoutBus(daemon_proc.stdout)
@@ -1193,8 +1300,22 @@ def main():
                          "attention. Default 2048 (set in C++); only kicks in "
                          "once kv_cache > window. Trades attention range for "
                          "long-context decode speed.")
-    ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B",
-                    help="HF tokenizer id; Qwen3.6 shares this tokenizer.")
+    ap.add_argument("--tokenizer", type=str, default=None,
+                    help="HF tokenizer id; default inferred from target GGUF.")
+    ap.add_argument("--target-gpu", type=int, default=None,
+                    help="Visible CUDA device id for test_dflash (sets DFLASH_TARGET_GPU)")
+    ap.add_argument("--draft-gpu", type=int, default=None,
+                    help="Visible CUDA device id for draft (sets DFLASH_DRAFT_GPU)")
+    ap.add_argument("--target-gpus", type=str, default=None,
+                    help="Comma-separated target GPU ids for target-layer sharding (passes --target-gpus)")
+    ap.add_argument("--target-layer-split", nargs="?", const="", default=None,
+                    metavar="WEIGHTS",
+                    help="Optional comma-separated layer split weights for --target-gpus "
+                         "(omit WEIGHTS after the flag to use defaults)")
+    ap.add_argument("--draft-feature-mirror", action="store_true",
+                    help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
+    ap.add_argument("--peer-access", action="store_true",
+                    help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
     add_cli_flags(ap)
     ap.add_argument("--prefix-cache-slots", type=int, default=4,
                     help="Number of prefix-cache snapshot slots (0 to disable)")
@@ -1217,6 +1338,11 @@ def main():
     if args.fa_window is not None:
         os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
 
+    if args.target_gpu is not None:
+        os.environ["DFLASH_TARGET_GPU"] = str(args.target_gpu)
+    if args.draft_gpu is not None:
+        os.environ["DFLASH_DRAFT_GPU"] = str(args.draft_gpu)
+
     # When pflash is on, daemon needs the same env the bench harness uses
     # (otherwise post-compress draft graph reserve OOMs at 64K+).
     if args.prefill_compression != "off":
@@ -1228,16 +1354,26 @@ def main():
         # TTFT. setdefault so explicit user overrides still win.
         os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
         os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
+        if prefill_cfg.skip_park:
+            os.environ["DFLASH_COMPRESS_NO_PARK"] = "1"
 
-    if not args.bin.is_file():
-        raise SystemExit(f"binary not found at {args.bin}")
     if not args.target.is_file():
         raise SystemExit(f"target GGUF not found at {args.target}")
-    draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
-    if not draft.is_file():
-        raise SystemExit(f"draft safetensors not found at {args.draft}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    arch = _arch_from_gguf(args.target)
+
+    if not args.bin.is_file():
+        raise SystemExit(f"binary not found at {args.bin} (arch={arch})")
+
+    if arch in _LAGUNA_ARCHES:
+        draft = None
+    else:
+        draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
+        if not draft.is_file():
+            raise SystemExit(f"draft safetensors not found at {args.draft}")
+
+    tokenizer_id = args.tokenizer or _tokenizer_id_from_gguf(args.target)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
     stop_ids = set()
     for s in ("<|im_end|>", "<|endoftext|>"):
         ids = tokenizer.encode(s, add_special_tokens=False)
@@ -1248,21 +1384,40 @@ def main():
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
 
+    extra_daemon: list[str] = []
+    if args.draft_feature_mirror:
+        extra_daemon.append("--draft-feature-mirror")
+    if args.peer_access:
+        extra_daemon.append("--peer-access")
+    if args.target_gpus:
+        extra_daemon.append(f"--target-gpus={args.target_gpus}")
+        if args.target_layer_split:
+            extra_daemon.append(f"--target-layer-split={args.target_layer_split}")
+        extra_daemon.append("--target-split-load-draft")
+        extra_daemon.append("--target-split-dflash")
+        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
+            print("  [cfg] target-gpus daemon mode disables prefix/full cache slots (snapshot protocol unsupported)")
+            args.prefix_cache_slots = 0
+            args.prefill_cache_slots = 0
+
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
-                    prefill_cache_slots=args.prefill_cache_slots)
+                    prefill_cache_slots=args.prefill_cache_slots,
+                    arch=arch,
+                    extra_daemon_args=extra_daemon or None)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server (tool-aware) on http://{args.host}:{args.port}")
-    print(f"  target = {args.target}")
-    print(f"  draft  = {draft}")
-    print(f"  bin    = {args.bin}")
-    print(f"  budget = {args.budget}")
-    print(f"  max_ctx= {args.max_ctx}")
-    print(f"  tokenizer = {args.tokenizer}")
+    print(f"  arch      = {arch}")
+    print(f"  target    = {args.target}")
+    print(f"  draft     = {draft}")
+    print(f"  bin       = {args.bin}")
+    print(f"  budget    = {args.budget}")
+    print(f"  max_ctx   = {args.max_ctx}")
+    print(f"  tokenizer = {tokenizer_id}")
     if prefill_cfg.enabled:
         print(f"  pflash = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "
               f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
