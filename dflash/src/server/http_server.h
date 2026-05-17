@@ -15,6 +15,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
+#include "prefix_cache.h"
 #include "api_types.h"
 #include "third_party/nlohmann/json.hpp"
 
@@ -43,6 +44,7 @@ struct ServerConfig {
     int         max_ctx     = 131072;   // model context window
     bool        enable_cors = true;
     std::string model_name  = "dflash";
+    int         prefix_cache_cap = 4;   // prefix cache slots (0 disables)
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -121,6 +123,7 @@ private:
     ServerConfig     config_;
     ChatFormat       chat_format_;
     ToolMemory       tool_memory_;
+    PrefixCache      prefix_cache_;
 
     // Worker thread.
     std::thread                     worker_thread_;

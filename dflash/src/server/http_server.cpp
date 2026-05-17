@@ -42,6 +42,7 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
+    , prefix_cache_(config.prefix_cache_cap, tokenizer)
 {
 }
 
@@ -381,6 +382,18 @@ void HttpServer::worker_loop() {
         gen_req.do_sample = req.sampler.temp > 0.0f;
         gen_req.stream = false;  // we handle streaming via on_token callback
 
+        // Prefix cache: check for cached KV state.
+        auto [cache_slot, prefix_len] = prefix_cache_.lookup(req.prompt_tokens);
+        bool using_restore = (cache_slot >= 0);
+
+        // Prepare inline snapshot for future cache hits.
+        auto [snap_slot, snap_cut] = prefix_cache_.prepare_inline_snap(req.prompt_tokens);
+        bool snap_prepared = (snap_slot >= 0);
+        if (snap_prepared) {
+            gen_req.snap_slot = snap_slot;
+            gen_req.snap_pos = snap_cut;
+        }
+
         // Set up DaemonIO with on_token callback for streaming + disconnect.
         DaemonIO io;
         io.stream_fd = -1;  // no pipe — we write SSE directly
@@ -406,8 +419,22 @@ void HttpServer::worker_loop() {
             return true;
         };
 
-        // Run generation.
-        GenerateResult result = backend_.generate(gen_req, io);
+        // Run generation (with or without restore).
+        GenerateResult result;
+        if (using_restore) {
+            result = backend_.restore_and_generate(cache_slot, gen_req, io);
+        } else {
+            result = backend_.generate(gen_req, io);
+        }
+
+        // Confirm or abort the inline snapshot.
+        if (snap_prepared) {
+            if (completion_tokens > 0 && !client_disconnected) {
+                prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, req.prompt_tokens);
+            } else {
+                prefix_cache_.abort_inline_snap(snap_slot);
+            }
+        }
 
         // Finalize.
         if (req.stream && !client_disconnected) {
