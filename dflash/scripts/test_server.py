@@ -12,7 +12,7 @@ from server import (
     build_app, MODEL_NAME,
     parse_tool_calls, parse_reasoning,
     normalize_stop, first_stop_match,
-    _thinking_enabled,
+    _thinking_enabled, strip_closed_think_prefill, split_unclosed_thinking,
 )
 
 
@@ -77,11 +77,25 @@ class TestParseReasoning:
         assert reasoning is None
 
     def test_started_in_thinking_no_close_tag(self):
-        """Truncated reasoning when prompt started in thinking mode."""
+        """Unclosed thinking still returns visible content instead of empty text."""
         cleaned, reasoning = parse_reasoning(
             "unfinished thought", started_in_thinking=True)
-        assert cleaned == ""
-        assert reasoning == "unfinished thought"
+        assert cleaned == "unfinished thought"
+        assert reasoning is None
+
+    def test_started_in_thinking_no_close_tag_splits_final_paragraph(self):
+        cleaned, reasoning = parse_reasoning(
+            "I should answer exactly.\n\nlucebox-client-ok",
+            started_in_thinking=True)
+        assert cleaned == "lucebox-client-ok"
+        assert reasoning == "I should answer exactly."
+
+    def test_started_in_thinking_no_close_tag_splits_final_answer_marker(self):
+        cleaned, reasoning = parse_reasoning(
+            "Compute the sum.\n\nFinal Answer: 4",
+            started_in_thinking=True)
+        assert cleaned == "4"
+        assert reasoning == "Compute the sum.\n\nFinal Answer:"
 
     def test_started_in_thinking_with_close_tag(self):
         """Full reasoning block when prompt started in thinking mode."""
@@ -108,11 +122,27 @@ class TestParseReasoning:
 
 
 class TestThinkingDefaults:
-    def test_thinking_enabled_defaults_on(self):
-        assert _thinking_enabled(None) is True
-        assert _thinking_enabled({}) is True
+    def test_thinking_enabled_defaults_off(self):
+        assert _thinking_enabled(None) is False
+        assert _thinking_enabled({}) is False
         assert _thinking_enabled({"enable_thinking": True}) is True
         assert _thinking_enabled({"enable_thinking": False}) is False
+
+    def test_strip_closed_think_prefill_at_end(self):
+        assert strip_closed_think_prefill("prompt<think></think>\n") == "prompt"
+        assert strip_closed_think_prefill("prompt<think>\n\n</think>\n\n") == "prompt"
+
+    def test_strip_closed_think_prefill_only_at_end(self):
+        text = "prompt<think></think>\nanswer"
+        assert strip_closed_think_prefill(text) == text
+
+    def test_split_unclosed_thinking_code_block(self):
+        content, reasoning = split_unclosed_thinking(
+            "Plan the function.\n\n**Final Output:** Provide the code.\n\n"
+            "```python\ndef add(a, b):\n    return a + b\n```")
+        assert content.startswith("```python")
+        assert "return a + b" in content
+        assert "Plan the function." in reasoning
 
 
 # ─── parse_tool_calls ─────────────────────────────────────────────
@@ -500,41 +530,45 @@ def test_zero_token_prompt_is_rejected_before_daemon(
 
 @patch("server.os.pipe")
 @patch("server.os.read")
-def test_chat_template_enables_thinking_by_default(
+def test_chat_template_disables_thinking_by_default_and_strips_closed_prefill(
         mock_os_read, mock_pipe, mock_tokenizer, app):
     mock_pipe.return_value = (1, 2)
+    mock_tokenizer.apply_chat_template.return_value = "prompt<think></think>\n"
     mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
 
     client = TestClient(app)
     response = client.post("/v1/chat/completions", json={
         "model": MODEL_NAME,
         "messages": [{"role": "user", "content": "hi"}],
-        "stream": False,
-    })
-
-    assert response.status_code == 200
-    kwargs = mock_tokenizer.apply_chat_template.call_args_list[-1][1]
-    assert kwargs["enable_thinking"] is True
-
-
-@patch("server.os.pipe")
-@patch("server.os.read")
-def test_chat_template_can_explicitly_disable_thinking(
-        mock_os_read, mock_pipe, mock_tokenizer, app):
-    mock_pipe.return_value = (1, 2)
-    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
-
-    client = TestClient(app)
-    response = client.post("/v1/chat/completions", json={
-        "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": "hi"}],
-        "chat_template_kwargs": {"enable_thinking": False},
         "stream": False,
     })
 
     assert response.status_code == 200
     kwargs = mock_tokenizer.apply_chat_template.call_args_list[-1][1]
     assert kwargs["enable_thinking"] is False
+    assert mock_tokenizer.encode.call_args_list[-1][0][0] == "prompt"
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_chat_template_can_explicitly_enable_thinking(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_tokenizer.apply_chat_template.return_value = "prompt<think>\n"
+    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
+
+    client = TestClient(app)
+    response = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": True},
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    kwargs = mock_tokenizer.apply_chat_template.call_args_list[-1][1]
+    assert kwargs["enable_thinking"] is True
+    assert mock_tokenizer.encode.call_args_list[-1][0][0] == "prompt<think>\n"
 
 
 @patch("server.os.pipe")
