@@ -70,17 +70,17 @@ Single-kernel CUDA inference for Qwen 3.5-0.8B on RTX 3090. All 24 layers run in
 
 ```bash
 # 1. clone + enter
-git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/megakernel
+git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 
-# 2. install (Python 3.10+, CUDA 12+, PyTorch 2.0+). Weights stream from HF on first run.
-python -m venv .venv && source .venv/bin/activate   # required on Ubuntu 24+ system Python (PEP 668)
-pip install --upgrade pip
-pip install torch                          # install BEFORE the next step; setup.py imports torch at build time
-pip install -e . --no-build-isolation      # --no-build-isolation lets the build see the torch you just installed
+# 2. install via the workspace (Python 3.12, CUDA 12+, PyTorch 2.0+).
+#    Weights stream from HF on first run.
+uv sync --extra megakernel          # builds the CUDA extension; torch is auto-installed first, then setup.py compiles
 
 # 3. run the benchmark (prefill pp520 + decode tg128 vs llama.cpp BF16 + PyTorch HF)
-python final_bench.py
+uv run --directory megakernel python final_bench.py
 ```
+
+> Don't have `uv`? Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or see [astral.sh/uv](https://astral.sh/uv/). The legacy `python -m venv` + `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
 
 | Method | Prefill pp520 | Decode tg128 | tok/J |
 |--------|:-------------:|:------------:|:-----:|
@@ -108,24 +108,28 @@ DFlash speculative decoding for Qwen3.5/Qwen3.6 27B GGUF targets on a single GPU
 
 ```bash
 # 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 
-# 2. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
+# 2. install Python deps via the workspace (creates one shared .venv at the
+#    repo root).
+uv sync
+
+# 3. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
 # Default compiles for Pascal/Volta/Turing/Ampere (60/61/62/70/75/86; +120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
 # 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target test_dflash -j
-cmake --build build --target test_generate -j
+cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake --build dflash/build --target test_dflash -j
+cmake --build dflash/build --target test_generate -j
 
-# 3. fetch weights: ~16 GB Q4_K_M target + 1.84 GB Lucebox Q8_0 GGUF DFlash draft
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir models/draft/
+# 4. fetch weights: ~16 GB Q4_K_M target + 1.84 GB Lucebox Q8_0 GGUF DFlash draft
+uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/
+uv run hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir dflash/models/draft/
 
-# 4a. one-shot streaming generate
-python3 scripts/run.py --prompt "def fibonacci(n):"
+# 5a. one-shot streaming generate
+uv run --directory dflash python scripts/run.py --prompt "def fibonacci(n):"
 
-# 4b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
-python3 scripts/bench_llm.py
+# 5b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
+uv run --directory dflash python scripts/bench_llm.py
 ```
 
 | Benchmark | AR (tok/s) | DFlash+DDTree (tok/s) | Speedup |
@@ -296,7 +300,7 @@ All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 309
 
 PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
 
-**Megakernel porting note.** `megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM ≥ 80 (Ampere+), BF16 is used. Just `pip install -e . --no-build-isolation` and the right code path is selected automatically.
+**Megakernel porting note.** `megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM >= 80 (Ampere+), BF16 is used. From the workspace root, `uv sync --extra megakernel` builds the extension; the legacy `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
 
 **Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W on 3090; re-sweep for other cards).
 

@@ -303,10 +303,11 @@ python3 scripts/run.py --prompt "def fibonacci(n):"
 # Multi-turn chat REPL
 python3 examples/chat.py
 
-# OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline)
-python3 -m venv .venv
-.venv/bin/pip install fastapi uvicorn transformers jinja2
-.venv/bin/python scripts/server.py --port 8000 --daemon
+# OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline).
+# Python deps are managed by the workspace at the repo root — run `uv sync`
+# once from `lucebox-hub/`, then the command below (uv finds the workspace
+# .venv automatically from any member subdir).
+uv run python scripts/server.py --port 8000 --daemon
 
 # Reproduce paper numbers
 python3 scripts/bench_llm.py                                 # HE + GSM8K + Math500

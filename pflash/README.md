@@ -60,32 +60,29 @@ Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is t
 PFlash is the algorithm. The implementation lives in [`../dflash/`](../dflash/) as part of the dflash daemon. The `pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
 
 ```bash
-# 1. build dflash with the BSA kernel (sm_80+; ~10 min cold compile pulls cutlass)
-cd lucebox-hub/dflash
+# 1. from the repo root, install Python deps and build dflash with the BSA
+#    kernel (sm_80+; ~10 min cold compile pulls cutlass)
+cd lucebox-hub
+uv sync
 git submodule update --init --recursive
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_CUDA_ARCHITECTURES=86 \
-                    -DDFLASH27B_ENABLE_BSA=ON
-cmake --build build --target test_dflash test_flashprefill_kernels -j
+cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release \
+                             -DCMAKE_CUDA_ARCHITECTURES=86 \
+                             -DDFLASH27B_ENABLE_BSA=ON
+cmake --build dflash/build --target test_dflash test_flashprefill_kernels -j
 
 # 2. fetch weights (target + spec-decode draft + drafter scorer)
-huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
-huggingface-cli download Qwen/Qwen3-0.6B model.safetensors tokenizer.json --local-dir models/drafter/
-huggingface-cli download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir models/draft/
+uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/
+uv run hf download Qwen/Qwen3-0.6B model.safetensors tokenizer.json --local-dir dflash/models/drafter/
+uv run hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir dflash/models/draft/
 
 # 2b. convert the drafter (Qwen3-0.6B HF) to a BF16 GGUF for the C++ scorer.
 #     The submodule already vendors llama.cpp at deps/llama.cpp.
-python deps/llama.cpp/convert_hf_to_gguf.py models/drafter \
-       --outtype bf16 --outfile models/Qwen3-0.6B-BF16.gguf
+uv run python dflash/deps/llama.cpp/convert_hf_to_gguf.py dflash/models/drafter \
+       --outtype bf16 --outfile dflash/models/Qwen3-0.6B-BF16.gguf
 
-# 3. install pflash bench harness (Python only used for benchmarking)
-cd ../pflash
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# 4. generate NIAH cases + run head-to-head bench against the C++ daemon
-python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
-python tests/bench_niah_cpp.py \
+# 3. generate NIAH cases + run head-to-head bench against the C++ daemon
+uv run --directory pflash python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
+uv run --directory pflash python tests/bench_niah_cpp.py \
   --bin    ../dflash/build/test_dflash \
   --target ../dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft-spec ../dflash/models/draft/model.safetensors \

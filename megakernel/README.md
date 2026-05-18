@@ -110,14 +110,15 @@ As more models go hybrid (and they will, because linear attention scales better)
 ## Quick start
 
 ```bash
-git clone https://github.com/Luce-Org/luce-megakernel
-cd luce-megakernel
-python3 -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip
-pip install torch                          # install BEFORE the next step; setup.py imports torch at build time
-pip install -e . --no-build-isolation      # --no-build-isolation lets the build see the torch you just installed
-python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
+git clone https://github.com/Luce-Org/lucebox-hub
+cd lucebox-hub
+uv sync --extra megakernel
+uv run --directory megakernel python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 ```
+
+The legacy standalone flow still works from inside `megakernel/`: create a
+virtualenv, install `torch`, then run `pip install -e . --no-build-isolation`
+so `setup.py` can import torch while compiling the CUDA extension.
 
 **Requirements:**
 - **RTX 3090** (sm_86, BF16) — primary target, all benchmarks above
