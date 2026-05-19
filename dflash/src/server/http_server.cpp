@@ -45,7 +45,9 @@ HttpServer::HttpServer(ModelBackend & backend,
     , prefix_cache_(config.prefix_cache_cap, tokenizer)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
-                   config.disk_cache_min_tokens}, backend)
+                   config.disk_cache_min_tokens,
+                   config.disk_cache_continued_interval,
+                   config.disk_cache_cold_max_tokens}, backend)
 {
     disk_cache_.init();
 }
@@ -55,6 +57,18 @@ HttpServer::~HttpServer() {
 }
 
 void HttpServer::shutdown() {
+    // Shutdown save: persist all tracked snapshot slots to disk.
+    if (!disk_cache_.disabled()) {
+        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
+                     slot_tokens_.size());
+        for (auto & [slot, tokens] : slot_tokens_) {
+            if (backend_.snapshot_used(slot)) {
+                disk_cache_.learn_layout(slot);
+                disk_cache_.save(slot, tokens);
+            }
+        }
+    }
+
     stopping_.store(true);
     queue_cv_.notify_all();
     if (listen_fd_ >= 0) {
@@ -598,6 +612,44 @@ void HttpServer::worker_loop() {
             }
         }
 
+        // Cold prefix save: for long prompts with no cache hit, prefill to a
+        // turn boundary and save a cold checkpoint before the full generation.
+        // This makes subsequent requests to similar (but not identical) prompts
+        // much faster by reusing the cold prefix.
+        if (!using_restore && !disk_cache_.disabled()) {
+            auto boundaries = find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+            int cold_boundary = disk_cache_.cold_prefix_boundary(effective_prompt, boundaries);
+            if (cold_boundary > 0) {
+                std::fprintf(stderr, "[disk-cache] cold prefix: prefilling to boundary=%d\n",
+                             cold_boundary);
+                // Phase 1: prefill to cold_boundary with snapshot save.
+                GenerateRequest cold_req;
+                cold_req.prompt = std::vector<int32_t>(effective_prompt.begin(),
+                                                       effective_prompt.begin() + cold_boundary);
+                cold_req.n_gen = 0;  // no decode, just prefill
+                cold_req.snap_slot = DISK_STAGING_SLOT;
+                cold_req.snap_pos = cold_boundary;  // save at end of prefix
+                DaemonIO cold_io;
+                cold_io.stream_fd = -1;
+                auto cold_result = backend_.generate(cold_req, cold_io);
+                if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
+                    std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
+                                                       effective_prompt.begin() + cold_boundary);
+                    disk_cache_.save(DISK_STAGING_SLOT, prefix_tokens);
+                    // Use this cold snapshot as restore point for full generation.
+                    cache_slot = DISK_STAGING_SLOT;
+                    prefix_len = cold_boundary;
+                    using_restore = true;
+                    disk_hit = true;  // ensure staging slot is freed after use
+                    std::fprintf(stderr, "[disk-cache] cold prefix saved, restoring from %d\n",
+                                 cold_boundary);
+                } else {
+                    backend_.snapshot_free(DISK_STAGING_SLOT);
+                }
+            }
+        }
+
         // Prepare inline snapshot for future cache hits.
         auto [snap_slot, snap_cut] = prefix_cache_.prepare_inline_snap(effective_prompt);
         bool snap_prepared = (snap_slot >= 0);
@@ -651,6 +703,9 @@ void HttpServer::worker_loop() {
         if (snap_prepared) {
             if (completion_tokens > 0 && !client_disconnected) {
                 prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
+                // Track for shutdown save.
+                slot_tokens_[snap_slot] = std::vector<int32_t>(
+                    effective_prompt.begin(), effective_prompt.begin() + snap_cut);
                 // Save to disk cache if threshold met.
                 if (!disk_cache_.disabled()) {
                     disk_cache_.learn_layout(snap_slot);
@@ -664,6 +719,23 @@ void HttpServer::worker_loop() {
         // Free the disk staging slot after use.
         if (disk_hit) {
             backend_.snapshot_free(DISK_STAGING_SLOT);
+        }
+
+        // Continued checkpoint: save if total tokens crossed an interval boundary.
+        // This captures prompt + all generated tokens for long conversation reuse.
+        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 && !client_disconnected) {
+            int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
+            if (final_pos >= disk_cache_.continued_interval()) {
+                // Build all_tokens = effective_prompt + result.tokens
+                std::vector<int32_t> all_tokens(effective_prompt);
+                all_tokens.insert(all_tokens.end(), result.tokens.begin(), result.tokens.end());
+                // Save a snapshot of the live KV at end-of-generation.
+                if (backend_.snapshot_save(DISK_STAGING_SLOT)) {
+                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
+                    disk_cache_.maybe_store_continued(DISK_STAGING_SLOT, all_tokens, final_pos);
+                    backend_.snapshot_free(DISK_STAGING_SLOT);
+                }
+            }
         }
 
         // Full-compress cache: reserve + confirm after successful generation.

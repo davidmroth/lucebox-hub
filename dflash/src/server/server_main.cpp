@@ -18,10 +18,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <memory>
 #include <string>
 
 using namespace dflash27b;
+
+// Global server pointer for signal handling.
+static HttpServer * g_server = nullptr;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    if (g_server) {
+        g_server->shutdown();
+    }
+}
 
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
@@ -53,6 +64,8 @@ static void print_usage(const char * prog) {
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
         "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
+        "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
+        "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
         "\n", prog);
 }
 
@@ -122,6 +135,10 @@ int main(int argc, char ** argv) {
             sconfig.disk_cache_budget_mb = (size_t)std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-min-tokens") == 0 && i + 1 < argc) {
             sconfig.disk_cache_min_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-interval") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_continued_interval = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-cold-max") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_cold_max_tokens = std::atoi(argv[++i]);
         } else {
             std::fprintf(stderr, "[server] unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -176,6 +193,9 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] starting HTTP server on %s:%d (max_ctx=%d, fa_window=%d)\n",
                  sconfig.host.c_str(), sconfig.port, sconfig.max_ctx, bargs.fa_window);
     HttpServer server(*backend, tokenizer, sconfig);
+    g_server = &server;
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGINT, signal_handler);
     if (pflash_enabled) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }

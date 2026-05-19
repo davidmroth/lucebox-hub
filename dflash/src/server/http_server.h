@@ -28,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace dflash27b {
@@ -59,6 +60,8 @@ struct ServerConfig {
     std::string disk_cache_dir;             // empty = disabled
     size_t      disk_cache_budget_mb = 4096; // max disk usage in MB
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
+    int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
+    int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -142,6 +145,9 @@ private:
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
+
+    // Track prompt tokens for each snapshot slot (for shutdown save).
+    std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
 
     // Worker thread.
     std::thread                     worker_thread_;

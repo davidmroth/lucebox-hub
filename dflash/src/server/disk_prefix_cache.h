@@ -29,6 +29,8 @@ struct DiskCacheConfig {
     std::string cache_dir;          // base directory (empty = disabled)
     size_t      budget_bytes = (size_t)4 * 1024 * 1024 * 1024;  // 4 GB default
     int         min_tokens   = 512; // only persist snapshots >= this many tokens
+    int         continued_interval = 10240; // save every N tokens during long sessions
+    int         cold_max_tokens = 10240;    // create cold checkpoint for prompts longer than this
 };
 
 // ─── File header (64 bytes, little-endian) ──────────────────────────────
@@ -86,6 +88,23 @@ public:
     // Returns true on success.
     bool save(int slot, const std::vector<int32_t> & prompt_ids);
 
+    // Check if a continued checkpoint should be saved after generation.
+    // `all_tokens` = prompt + generated tokens, `cur_pos` = final position.
+    // If cur_pos crosses a continued-interval boundary since last save,
+    // saves a snapshot using `slot`. Returns true if a save occurred.
+    bool maybe_store_continued(int slot, const std::vector<int32_t> & all_tokens,
+                               int cur_pos);
+
+    // Reset the continued-store tracking (call at start of each request).
+    void reset_continued() { continued_last_store_pos_ = 0; }
+
+    // Find the cold boundary for a long prompt. Returns the token count at
+    // which to create a cold checkpoint, or 0 if no cold save is needed.
+    // A cold save is needed when: prompt is longer than cold_max_tokens AND
+    // there's no existing disk entry covering a prefix of this prompt.
+    int cold_prefix_boundary(const std::vector<int32_t> & prompt_ids,
+                             const std::vector<int> & boundaries);
+
     // Evict files until total disk usage is within budget.
     void enforce_budget();
 
@@ -95,6 +114,9 @@ public:
     // Get total bytes used on disk.
     size_t total_bytes() const { return total_bytes_; }
 
+    // Get the continued-interval setting.
+    int continued_interval() const { return config_.continued_interval; }
+
     // Learn the layout fingerprint from a live snapshot (call once after
     // first snapshot_save, before any disk operations).
     void learn_layout(int slot);
@@ -102,6 +124,9 @@ public:
 private:
     DiskCacheConfig config_;
     ModelBackend &  backend_;
+
+    // Continued checkpoint tracking (per-session).
+    int continued_last_store_pos_ = 0;
 
     // Layout fingerprint (learned from first snapshot).
     std::array<uint8_t, 16> layout_id_{};
@@ -116,6 +141,8 @@ private:
         uint32_t    cur_pos     = 0;
         uint64_t    file_size   = 0;
         uint64_t    last_used   = 0;
+        uint32_t    hits        = 0;
+        uint64_t    created_at  = 0;  // for eviction protection
     };
     std::vector<DiskEntry> entries_;
     size_t total_bytes_ = 0;
