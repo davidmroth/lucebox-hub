@@ -284,6 +284,9 @@ endif()
 # The dispatch in qwen3_graph.cpp checks buffer type at runtime:
 #   BF16 buffers → bf16 WMMA kernel; F16 buffers → f16 WMMA kernel; else → ggml FA.
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    # rms_norm_hip.cu is needed by the HIP chunk-B graph path regardless of SM80_EQUIV.
+    target_sources(dflash27b PRIVATE src/rms_norm_hip.cu)
+    set_source_files_properties(src/rms_norm_hip.cu PROPERTIES LANGUAGE HIP)
     if(DFLASH27B_HIP_SM80_EQUIV)
         find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_dflash27b_rocm_root}/include" /opt/rocm/include

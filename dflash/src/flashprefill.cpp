@@ -255,6 +255,11 @@ int flash_prefill_forward_bf16(
 #ifdef DFLASH27B_BACKEND_HIP
     // mean_Q layout: [B, M, H, D] BF16
     int s_mQ_b = M * H * D, s_mQ_m = H * D, s_mQ_h = D;
+    // The GEMM kernel (compute_block_score_gemm_bf16) loads 16×16 rocWMMA tiles and
+    // always reads 16 rows of mean_Q/mean_K regardless of M. If M < 16 the last
+    // (16-M) rows fall outside the allocation → GPU memory fault. Pad to next
+    // multiple of 16 so those reads land in allocated (harmless) memory.
+    const int M_gemm = ((M + 15) / 16) * 16;
 #endif
 
     // Allocate scratch on the same device as Q.
@@ -262,10 +267,14 @@ int flash_prefill_forward_bf16(
     float * dS = nullptr, * dM = nullptr;
     int32_t * dIdx = nullptr, * dCnt = nullptr;
     cudaError_t e;
+#ifdef DFLASH27B_BACKEND_HIP
+    if ((e = cudaMalloc(&dmK,  (size_t)B * M_gemm * Hk * D * 2)) != cudaSuccess) goto err;  // bf16, padded
+#else
     if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
+#endif
     if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
 #ifdef DFLASH27B_BACKEND_HIP
-    if ((e = cudaMalloc(&dmQ,  (size_t)B * M * H  * D * 2)) != cudaSuccess) goto err;  // bf16
+    if ((e = cudaMalloc(&dmQ,  (size_t)B * M_gemm * H  * D * 2)) != cudaSuccess) goto err;  // bf16, padded
 #else
     if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
 #endif
