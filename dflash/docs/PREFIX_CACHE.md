@@ -68,20 +68,47 @@ entirely — the fastest path.
 
 ### Problem: VRAM Pressure on Discrete GPUs
 
-Each snapshot stores a full copy of the KV cache tensors. For large
-contexts this can be substantial:
+Naive snapshots stored **full max_ctx KV tensors** regardless of actual
+cache occupancy. For short prefixes this was extremely wasteful:
 
-| Model | max_ctx | Per-snapshot size |
-|-------|---------|-------------------|
-| Qwen3.5-27B (Q8_0 KV) | 64000 | ~1.3–1.5 GB |
-| Gemma4 | 32768 | ~0.5–0.8 GB |
-| Laguna | 16384 | ~0.2–0.4 GB |
+| Model | max_ctx | Full snapshot | Right-sized (29 tokens) |
+|-------|---------|--------------|------------------------|
+| Qwen3.5-27B (Q8_0 KV) | 64000 | ~1.5 GB | ~0.17 MB |
+| Gemma4 | 32768 | ~0.5 GB | ~0.05 MB |
+| Laguna | 16384 | ~0.3 GB | ~0.03 MB |
 
-With `cap=4` slots, this can consume 4–6 GB. On a 22 GB discrete GPU that
-already holds model weights (~15 GB) plus runtime cache (~2 GB), this causes
-VRAM spill to system RAM via PCIe, resulting in 5×+ slowdowns.
+With 3 inline snapshots at cur_pos=29,138,265 the old code allocated ~4.5 GB
+of GPU memory (on a 22 GB card already holding ~17 GB for model+cache),
+causing spill to system RAM and 5× decode slowdowns.
 
-### Solution: Platform-Aware Snapshot Backend
+### Solution: Right-Sized Snapshots + Platform-Aware Backend
+
+Two complementary fixes:
+
+1. **Right-sized allocation**: KV tensors are allocated as
+   `[head_dim, cur_pos, n_head_kv]` instead of `[head_dim, max_ctx, n_head_kv]`.
+   This reduces per-snapshot memory from ~1.5 GB to a few MB for typical
+   prefix lengths.
+
+2. **Platform-aware backend**: Snapshots are stored on system RAM (CPU backend)
+   for discrete GPUs, keeping VRAM free for model weights and active cache.
+
+```cpp
+// Right-sized KV allocation in snapshot_target_cache():
+ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type,
+                                      sk->ne[0], snap_pos, sk->ne[2]);
+// snap_pos = cache.cur_pos (e.g., 29 instead of 64000)
+```
+
+**Buffer reuse**: When the same slot is saved at the same `cur_pos`, the
+existing buffer is reused (no free+alloc). Only when `cur_pos` changes is
+the buffer freed and a new (still tiny) one allocated.
+
+**Strip copy**: Since right-sized KV tensors have different ne[1] than the
+full-size cache, save/restore uses per-head strip copies via
+`ggml_backend_tensor_get/set` — the same pattern as thin snapshots.
+
+### Platform-Aware Snapshot Backend
 
 Snapshots are stored on a **snapshot backend** selected at init time based
 on the compute backend's memory characteristics:
@@ -114,12 +141,9 @@ compute_backend's default buffer type is host-accessible?
 
 ### Cross-Backend Transfer
 
-`ggml_backend_tensor_copy(src, dst)` transparently handles:
-- Same-backend copy (unified case): direct memcpy or no-op
-- Cross-backend copy (discrete case): GPU→CPU get + CPU→GPU set internally
-
-This means snapshot save/restore code is **backend-agnostic** — it just
-calls `ggml_backend_tensor_copy()` regardless of where tensors reside.
+Right-sized snapshots use `ggml_backend_tensor_get/set` with explicit
+offsets for KV tensors (since source and destination have different shapes).
+SSM/conv state (fixed-size) uses `ggml_backend_tensor_copy()` directly.
 
 ### Integration Pattern (per-backend)
 
@@ -132,9 +156,10 @@ ggml_backend_t snap_backend_ = nullptr;
 // init():
 snap_backend_ = create_snapshot_backend(compute_backend_);
 
-// snapshot_save(): allocate snapshot tensors on snap_backend_
-ggml_backend_alloc_ctx_tensors(snap.ctx, snap_backend_);
-ggml_backend_tensor_copy(cache.k[il], snap.k[il]);  // works cross-backend
+// snapshot_save(): right-sized alloc + partial copy
+//   KV: [head_dim, cur_pos, n_head_kv] on snap_backend_
+//   SSM/conv: full-size on snap_backend_
+//   target_feat: [fc_in, min(cur_pos, cap)] on snap_backend_
 
 // shutdown(): free in correct order
 for (auto & s : snapshots_) free_snapshot(s);  // free tensors first

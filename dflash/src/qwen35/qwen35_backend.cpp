@@ -180,7 +180,6 @@ bool Qwen35Backend::unpark(const std::string & what) {
 
 bool Qwen35Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    snapshot_free(slot);
     PrefixSnapshot & snap = prefix_snapshots_[slot];
     return snapshot_target_cache(w_, cache_, snap_backend_, snap);
 }
