@@ -30,7 +30,6 @@ extern "C" {
 #define DFLASH27B_TARGET_HEAD_DIM      128
 #define DFLASH27B_TARGET_INTERMEDIATE  17408
 #define DFLASH27B_TARGET_VOCAB         248320
-#define DFLASH27B_ROPE_THETA           10000000.0f
 #define DFLASH27B_RMS_EPS              1e-6f
 
 #define DFLASH27B_DRAFT_LAYERS         5

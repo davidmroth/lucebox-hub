@@ -230,7 +230,7 @@ struct DraftWeights {
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;  // sliding window size (0 = disabled)
-    float rope_theta = DFLASH27B_ROPE_THETA;  // RoPE frequency base
+    float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
 
     // DFlash draft-specific config (populated by loader or set by caller).
     int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)

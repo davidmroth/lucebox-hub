@@ -241,7 +241,10 @@ bool load_draft_gguf(const std::string & path,
     out.head_dim  = (int)head_dim;
     out.n_embd    = (int)n_embd;
     out.n_ff      = (int)n_ff;
-    out.rope_theta = read_f32("rope.freq_base", DFLASH27B_ROPE_THETA);
+    out.rope_theta = read_f32("rope.freq_base", 0.0f);
+    if (out.rope_theta == 0.0f) {
+        fprintf(stderr, "[draft-gguf] WARNING: rope.freq_base not found in GGUF, draft RoPE will be wrong\n");
+    }
     out.layers.assign((size_t)n_layer, DraftLayer{});
 
     auto g = [&](const char * name) -> ggml_tensor * {
