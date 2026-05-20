@@ -69,15 +69,43 @@ void Gemma4Backend::print_ready_banner() const {
 
 bool Gemma4Backend::park(const std::string & what) {
     (void)what;
+    if (parked_) return true;
+
+    // Free snapshots first (they reference the snap_backend buffer)
+    for (int i = 0; i < PREFIX_SLOTS; ++i) {
+        free_gemma4_snapshot(snapshots_[i]);
+    }
+
+    // Free KV cache (GPU memory)
+    free_gemma4_cache(cache_);
+
+    // Free model weights (GPU memory)
+    free_gemma4_weights(w_);
+
     parked_ = true;
-    std::printf("[gemma4] parked\n"); std::fflush(stdout);
+    std::printf("[gemma4] parked (VRAM released)\n"); std::fflush(stdout);
     return true;
 }
 
 bool Gemma4Backend::unpark(const std::string & what) {
     (void)what;
+    if (!parked_) return true;
+
+    // Reload weights from disk
+    if (!load_gemma4_gguf(cfg_.model_path, backend_, w_)) {
+        std::fprintf(stderr, "[gemma4] unpark: failed to reload weights\n");
+        return false;
+    }
+
+    // Recreate KV cache
+    if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
+        std::fprintf(stderr, "[gemma4] unpark: failed to recreate cache\n");
+        free_gemma4_weights(w_);
+        return false;
+    }
+
     parked_ = false;
-    std::printf("[gemma4] unparked\n"); std::fflush(stdout);
+    std::printf("[gemma4] unparked (VRAM restored)\n"); std::fflush(stdout);
     return true;
 }
 
@@ -172,6 +200,8 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
 GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
                                         const DaemonIO & io) {
     GenerateResult result;
+    if (parked_) { result.error = "model is parked"; return result; }
+
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
@@ -249,6 +279,8 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
                                                      const GenerateRequest & req,
                                                      const DaemonIO & io) {
     GenerateResult result;
+    if (parked_) { result.error = "model is parked"; return result; }
+
     DaemonIO out_io = io.with_token_callback(req.on_token);
 
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {
@@ -371,6 +403,7 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
 // ── Snapshots ──────────────────────────────────────────────────────────
 
 bool Gemma4Backend::snapshot_save(int slot) {
+    if (parked_) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
 
     auto & snap = snapshots_[slot];
