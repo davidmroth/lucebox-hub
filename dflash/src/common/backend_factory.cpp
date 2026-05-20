@@ -37,7 +37,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         cfg.target_path        = args.model_path;
         cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
-        cfg.draft_gpu          = args.draft_gpu;
+        cfg.draft_gpu          = args.draft_device.gpu;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
         cfg.kq_stride_pad      = args.kq_stride_pad;
