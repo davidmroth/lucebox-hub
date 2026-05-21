@@ -81,7 +81,7 @@ static void t2_idempotent_open() {
     assert(m.open(path2, err));
     assert(m.is_open());
     assert(m.size() == size1);  // both temp files have same payload length
-    assert(err.empty() || true); // no error expected
+    assert(err.empty()); // no error expected after successful open
 
     std::remove(path1.c_str());
     std::remove(path2.c_str());
