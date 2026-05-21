@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdio>
 
-namespace dflash27b {
+namespace dflash::common {
 
 Gemma4DFlashTarget::Gemma4DFlashTarget(
         Gemma4Weights & w,
@@ -148,4 +148,4 @@ const std::vector<int> & Gemma4DFlashTarget::capture_layer_ids() const {
     return capture_ids_;
 }
 
-}  // namespace dflash27b
+}  // namespace dflash::common

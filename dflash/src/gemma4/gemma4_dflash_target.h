@@ -14,7 +14,7 @@
 
 #include <vector>
 
-namespace dflash27b {
+namespace dflash::common {
 
 class Gemma4DFlashTarget : public DFlashTarget {
 public:
@@ -60,4 +60,4 @@ private:
     Gemma4Snapshot verify_snap_;
 };
 
-}  // namespace dflash27b
+}  // namespace dflash::common

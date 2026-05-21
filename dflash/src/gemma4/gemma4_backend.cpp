@@ -936,7 +936,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
 
 void Gemma4Backend::free_drafter() {
     if (drafter_loaded_) {
-        dflash27b::free_drafter(drafter_ctx_);
+        ::dflash::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
     }
 }
