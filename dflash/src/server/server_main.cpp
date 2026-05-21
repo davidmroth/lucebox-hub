@@ -161,19 +161,25 @@ int main(int argc, char ** argv) {
             long n = std::ftell(f);
             std::fseek(f, 0, SEEK_SET);
             if (n <= 0) {
+                // The usage text promises "Empty or missing falls back to the
+                // hardcoded template." Honor that: log a warning and leave
+                // chat_template_src empty so http_server.cpp falls through to
+                // the hardcoded QWEN3/LAGUNA renderer, instead of aborting
+                // startup.
                 std::fclose(f);
-                std::fprintf(stderr, "[server] --chat-template-file: empty file '%s'\n", path);
-                return 1;
+                std::fprintf(stderr, "[server] --chat-template-file: '%s' is empty, "
+                                     "falling back to hardcoded template\n", path);
+            } else {
+                sconfig.chat_template_src.resize((size_t)n);
+                size_t got = std::fread(sconfig.chat_template_src.data(), 1, (size_t)n, f);
+                std::fclose(f);
+                if (got != (size_t)n) {
+                    std::fprintf(stderr, "[server] --chat-template-file: short read on '%s'\n", path);
+                    return 1;
+                }
+                sconfig.chat_template_path = path;
+                std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
-            sconfig.chat_template_src.resize((size_t)n);
-            size_t got = std::fread(sconfig.chat_template_src.data(), 1, (size_t)n, f);
-            std::fclose(f);
-            if (got != (size_t)n) {
-                std::fprintf(stderr, "[server] --chat-template-file: short read on '%s'\n", path);
-                return 1;
-            }
-            sconfig.chat_template_path = path;
-            std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
