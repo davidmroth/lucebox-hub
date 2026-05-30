@@ -618,6 +618,26 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     const int snap_pos = prefix_snapshots_[slot].cur_pos;
     cache_.cur_pos = snap_pos;
 
+    // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
+    // recurrent state / target_feat, but the draft-side feature mirror is left
+    // stale. Without re-syncing it the draft emits -1 -> verify_batch embed
+    // fails -> empty output on every cache hit. Mirror what do_prefill does.
+    if (!draft_parked_) {
+        const int ring_cap = remote_draft_.active() ? remote_draft_.ring_cap()
+                                                     : feature_mirror_.cap;
+        const int n = std::min(cache_.cur_pos, ring_cap);
+        if (n > 0) {
+            const int start = cache_.cur_pos - n;
+            if (remote_draft_.active()) {
+                sync_remote_draft_features(start, n);
+            } else if (feature_mirror_.target_feat && cache_.target_feat) {
+                draft_feature_mirror_sync_range(cache_.target_feat,
+                                                cache_.target_feat_cap,
+                                                feature_mirror_, start, n);
+            }
+        }
+    }
+
     // Daemon receives the FULL prompt; slice off the cached prefix and prefill
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
     int committed = snap_pos;
@@ -701,19 +721,31 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     int committed = kv_offset;
     for (int start = 0; start < prompt_len;) {
         const int kv_pos = kv_offset + start;
-        if (snap_pos >= 0 && snap_slot >= 0 && snap_pos == kv_pos) {
-            cache_.cur_pos = kv_pos;
-            if (snapshot_save(snap_slot)) {
-                std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, kv_pos);
-                std::fflush(stdout);
+
+        int n_tokens = std::min(prefill_ubatch, prompt_len - start);
+        // FIX(bug2): do NOT shrink the prefill chunk to snap_pos. Shrinking
+        // realigns every subsequent chunk, changing GPU batch sizes vs the
+        // no-cache path -> FP-nondeterministic state divergence -> different
+        // greedy output on cache hits. Keep uniform chunks. When snap_pos falls
+        // inside this chunk, snapshot at the chunk START boundary kv_pos: the
+        // largest chunk boundary <= snap_pos. That stays (a) chunk-aligned, so
+        // the prefill is bit-identical to the no-cache path, and (b) strictly
+        // within the requested prefix, so a later request that shares only the
+        // system-prompt prefix still restores a valid cross-request hit.
+        // (Rounding UP would push the snapshot to prompt end -> the full prompt
+        // incl. the user message -> a different user msg restores garbage.)
+        if (snap_slot >= 0 && snap_pos >= 0 &&
+            kv_pos <= snap_pos && snap_pos < kv_pos + n_tokens) {
+            if (kv_pos > kv_offset) {   // skip a degenerate short-prefix snapshot
+                cache_.cur_pos = kv_pos;
+                if (snapshot_save(snap_slot)) {
+                    std::printf("[snap] boundary slot=%d cur_pos=%d (req snap_pos=%d)\n",
+                                snap_slot, kv_pos, snap_pos);
+                    std::fflush(stdout);
+                }
             }
             snap_pos = -1;
             snap_slot = -1;
-        }
-
-        int n_tokens = std::min(prefill_ubatch, prompt_len - start);
-        if (snap_pos > kv_pos && snap_pos < kv_pos + n_tokens) {
-            n_tokens = snap_pos - kv_pos;
         }
         const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
@@ -784,15 +816,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         committed = kv_pos + n_tokens;
         cache_.cur_pos = committed;
-
-        if (snap_pos >= 0 && snap_slot >= 0 && committed == snap_pos) {
-            if (snapshot_save(snap_slot)) {
-                std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, committed);
-                std::fflush(stdout);
-            }
-            snap_pos = -1;
-            snap_slot = -1;
-        }
 
         // Sync draft-side features if active.
         if (remote_draft_.active() && !draft_parked_) {
