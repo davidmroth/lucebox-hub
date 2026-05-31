@@ -112,6 +112,11 @@ struct PipelinedDecodeState {
     // Persistent zero buffer for cold_in (set once at init)
     bool cold_in_zeroed = false;
 
+    // When true (default), cold experts are computed on the cold backend
+    // (CPU/Halo) instead of being dropped via cold-masking. Exact but slower.
+    // Set DFLASH_DROP_COLD=1 to disable (fast but lossy).
+    bool cold_compute = true;
+
     // Tracking
     int n_layer = 0;
     int n_embd = 0;
@@ -130,6 +135,7 @@ struct PipelinedDecodeState {
           routing_weights_buf(std::move(o.routing_weights_buf)),
           ffn_post_host_buf(std::move(o.ffn_post_host_buf)),
           cold_in_zeroed(o.cold_in_zeroed),
+          cold_compute(o.cold_compute),
           n_layer(o.n_layer), n_embd(o.n_embd),
           n_expert_used(o.n_expert_used),
           full_attention_interval(o.full_attention_interval) {
@@ -145,6 +151,7 @@ struct PipelinedDecodeState {
             routing_weights_buf = std::move(o.routing_weights_buf);
             ffn_post_host_buf = std::move(o.ffn_post_host_buf);
             cold_in_zeroed = o.cold_in_zeroed;
+            cold_compute = o.cold_compute;
             n_layer = o.n_layer; n_embd = o.n_embd;
             n_expert_used = o.n_expert_used;
             full_attention_interval = o.full_attention_interval;

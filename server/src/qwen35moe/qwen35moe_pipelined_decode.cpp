@@ -138,6 +138,10 @@ bool init_pipelined_decode_state(
     // Check if routed FFN pipeline is disabled
     const bool routed_disabled = (std::getenv("DFLASH_QWEN35MOE_NO_ROUTED") != nullptr);
 
+    // Cold experts are computed on the cold backend (CPU/Halo) by default.
+    // Set DFLASH_DROP_COLD=1 to skip cold computation (fast but lossy).
+    out.cold_compute = (std::getenv("DFLASH_DROP_COLD") == nullptr);
+
     // Build cached pre-FFN graphs for all DeltaNet layers.
     out.cached_prefn.resize((size_t)w.n_layer);
     int cached_prefn_count = 0;
@@ -177,8 +181,9 @@ bool init_pipelined_decode_state(
         }
     }
 
-    std::fprintf(stderr, "[pipelined] cached %d prefn + %d routed FFN graphs\n",
-                 cached_prefn_count, routed_count);
+    std::fprintf(stderr, "[pipelined] cached %d prefn + %d routed FFN graphs%s\n",
+                 cached_prefn_count, routed_count,
+                 out.cold_compute ? "" : " (drop_cold=lossy)");
 
     out.cold_in_zeroed = true;
     return true;
@@ -216,10 +221,13 @@ bool pipelined_decode_one_token(
         // ROUTED FFN FAST PATH (StreamMoE-inspired async pipeline):
         // prefn(async) → copy routing → routed_ffn(async) → combine(async)
         // Zero CPU sync between stages — GPU stream ordering guarantees correctness.
+        // Skipped when cold_compute is enabled and layer has cold experts
+        // (forces split path for exact cold expert computation).
         // ══════════════════════════════════════════════════════════════════════
         if (!is_attn
             && state.cached_prefn[(size_t)il].valid()
-            && state.cached_routed_ffn[(size_t)il].valid()) {
+            && state.cached_routed_ffn[(size_t)il].valid()
+            && !(state.cold_compute && !hybrid.layers[(size_t)il].cold_expert_ids.empty())) {
 
             auto & cpg = state.cached_prefn[(size_t)il];
             auto & rffn = state.cached_routed_ffn[(size_t)il];
@@ -395,8 +403,9 @@ bool pipelined_decode_one_token(
         const auto & L = w.layers[(size_t)il];
 
         // Try routed FFN fast path for this layer (works for attention layers too)
+        // Skipped when cold_compute is enabled and layer has cold experts.
         auto & rffn = state.cached_routed_ffn[(size_t)il];
-        if (rffn.valid()) {
+        if (rffn.valid() && !(state.cold_compute && !storage.cold_expert_ids.empty())) {
             // Cold-masking approach: remap global→local, zero cold weights
             int32_t local_ids[8];
             float   masked_weights[8];
