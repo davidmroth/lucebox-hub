@@ -94,6 +94,12 @@ private:
 
     // Hybrid mode helpers
     bool init_hybrid_mode();
+    // Build hot/cold expert storage for `placement` by re-reading expert weights
+    // from the GGUF mmap (partial-load mode keeps no full expert tensors resident).
+    // Used by both init and post-request swap so the two paths can never diverge.
+    bool build_hybrid_storage_from_file(const MoeHybridPlacement & placement,
+                                        std::shared_ptr<MoeHybridStorage> & out_storage,
+                                        std::string & err);
     GenerateResult generate_hybrid(const GenerateRequest & req, const DaemonIO & io);
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,
