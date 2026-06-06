@@ -797,7 +797,8 @@ static bool build_laguna_layer_prefn_step(
     ggml_backend_t backend,
     int il,
     int kv_start,
-    int n_tokens)
+    int n_tokens,
+    const dflash::common::MoeHybridLayerStorage * hot_storage = nullptr)
 {
     step_graph_free(sg);
 
@@ -973,15 +974,55 @@ static bool build_laguna_layer_prefn_step(
             weights_normed = ggml_scale(sg.ctx, weights_normed, w.expert_weights_scale);
         }
         sg.moe_weights = weights_normed;
-        ggml_set_output(weights_normed);
-
         sg.moe_selected.resize(1);
         sg.moe_selected[0] = selected;
 
-        ggml_build_forward_expand(sg.gf, normed);
-        ggml_build_forward_expand(sg.gf, ffn_inp);
-        ggml_build_forward_expand(sg.gf, selected);
-        ggml_build_forward_expand(sg.gf, weights_normed);
+        static const bool g_fuse = (std::getenv("DFLASH_LAGUNA_FUSE_FFN") != nullptr);
+        if (hot_storage && g_fuse && hot_storage->gate_hot) {
+            // Fused routed FFN in-graph (mirrors gpu_remap), drop-on-miss via valid_lut.
+            MoeLayerDesc d = make_moe_layer_desc(w.layers[(size_t)il]);
+            const int nu = w.n_expert_used;
+            sg.hot_local_lut = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I32, 1, w.n_expert); ggml_set_input(sg.hot_local_lut);
+            sg.valid_lut     = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, 1, w.n_expert); ggml_set_input(sg.valid_lut);
+            ggml_tensor * lid = ggml_get_rows(sg.ctx, sg.hot_local_lut, selected);
+            ggml_tensor * ids = ggml_cont(sg.ctx, ggml_reshape_2d(sg.ctx, lid, nu, 1));
+            ggml_tensor * vm  = ggml_reshape_2d(sg.ctx, ggml_get_rows(sg.ctx, sg.valid_lut, selected), nu, 1);
+            ggml_tensor * wmask = ggml_mul(sg.ctx, weights_normed, vm);
+            ggml_tensor * cur3 = ggml_reshape_3d(sg.ctx, normed, w.n_embd, 1, 1);
+            auto SC = [&](ggml_tensor * t, float s){ return s != 1.0f ? ggml_scale(sg.ctx, t, s) : t; };
+            ggml_tensor * ge = SC(ggml_mul_mat_id(sg.ctx, hot_storage->gate_hot, cur3, ids), d.ffn_gate_exps_s);
+            ggml_tensor * ue = SC(ggml_mul_mat_id(sg.ctx, hot_storage->up_hot,   cur3, ids), d.ffn_up_exps_s);
+            ggml_tensor * gu = ggml_swiglu_split(sg.ctx, ge, ue);
+            ggml_tensor * ex = SC(ggml_mul_mat_id(sg.ctx, hot_storage->down_hot, gu, ids), d.ffn_down_exps_s);
+            ex = ggml_mul(sg.ctx, ex, ggml_reshape_3d(sg.ctx, wmask, 1, nu, 1));
+            ggml_tensor * routed = nullptr;
+            for (int i = 0; i < nu; ++i) {
+                ggml_tensor * sl = ggml_view_2d(sg.ctx, ex, w.n_embd, 1, ex->nb[2], (size_t)i * ex->nb[1]);
+                routed = (i == 0) ? sl : ggml_add(sg.ctx, routed, sl);
+            }
+            ggml_tensor * shared = nullptr;
+            if (d.has_shared_expert()) {
+                ggml_tensor * shg = SC(ggml_mul_mat(sg.ctx, d.ffn_gate_shexp, normed), d.ffn_gate_shexp_s);
+                ggml_tensor * shu = SC(ggml_mul_mat(sg.ctx, d.ffn_up_shexp,   normed), d.ffn_up_shexp_s);
+                ggml_tensor * shgu = ggml_swiglu_split(sg.ctx, shg, shu);
+                shared = SC(ggml_mul_mat(sg.ctx, d.ffn_down_shexp, shgu), d.ffn_down_shexp_s);
+                if (d.ffn_gate_inp_shexp) {
+                    ggml_tensor * g2 = ggml_sigmoid(sg.ctx, SC(ggml_mul_mat(sg.ctx, d.ffn_gate_inp_shexp, normed), d.ffn_gate_inp_shexp_s));
+                    shared = ggml_mul(sg.ctx, shared, g2);
+                }
+            }
+            ggml_tensor * out = shared ? (routed ? ggml_add(sg.ctx, routed, shared) : shared) : routed;
+            ggml_tensor * layer_out = ggml_cont(sg.ctx, ggml_add(sg.ctx, out, ffn_inp));
+            sg.hidden_input = layer_out;
+            ggml_set_output(layer_out);
+            ggml_build_forward_expand(sg.gf, layer_out);
+        } else {
+            ggml_set_output(weights_normed);
+            ggml_build_forward_expand(sg.gf, normed);
+            ggml_build_forward_expand(sg.gf, ffn_inp);
+            ggml_build_forward_expand(sg.gf, selected);
+            ggml_build_forward_expand(sg.gf, weights_normed);
+        }
     }
 
     // Allocate
@@ -1027,7 +1068,7 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
         const bool is_dense = (il < w_.n_layer_dense_lead);
 
         const auto _t_b = _prof ? _pnow() : _pclk::time_point{};
-        if (!build_laguna_layer_prefn_step(layer_sg, w_, cache_, backend_, il, kv_pos, 1)) {
+        if (!build_laguna_layer_prefn_step(layer_sg, w_, cache_, backend_, il, kv_pos, 1, &moe_hybrid_->layers[(size_t)il])) {
             step_graph_destroy(layer_sg);
             gpu_state.destroy();
             return false;
@@ -1048,6 +1089,18 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
             ggml_backend_tensor_set(layer_sg.attn_mask, mask_data.data(), 0, sizeof(float) * (size_t)kv_len);
         }
 
+        static const bool g_fuse_dec = (std::getenv("DFLASH_LAGUNA_FUSE_FFN") != nullptr);
+        if (g_fuse_dec && !is_dense && layer_sg.hot_local_lut) {
+            auto & _st = moe_hybrid_->layers[(size_t)il];
+            std::vector<int32_t> _lut((size_t)w_.n_expert); std::vector<float> _vld((size_t)w_.n_expert);
+            for (int g = 0; g < w_.n_expert; ++g) {
+                int loc = (g < (int)_st.hot_local_by_global.size()) ? _st.hot_local_by_global[(size_t)g] : -1;
+                _lut[(size_t)g] = loc >= 0 ? loc : 0;
+                _vld[(size_t)g] = loc >= 0 ? 1.0f : 0.0f;
+            }
+            ggml_backend_tensor_set(layer_sg.hot_local_lut, _lut.data(), 0, sizeof(int32_t)*(size_t)w_.n_expert);
+            ggml_backend_tensor_set(layer_sg.valid_lut, _vld.data(), 0, sizeof(float)*(size_t)w_.n_expert);
+        }
         const auto _t_c = _prof ? _pnow() : _pclk::time_point{};
         auto st = ggml_backend_graph_compute(backend_, layer_sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
@@ -1060,6 +1113,20 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
         if (is_dense) {
             // Dense layer: read full output back to GPU-resident state
             ggml_backend_tensor_copy(layer_sg.hidden_input, gpu_state.act_cur);
+        } else if (g_fuse_dec && layer_sg.hidden_input) {
+            // Fused FFN computed in-graph -> layer output is hidden_input
+            ggml_backend_tensor_copy(layer_sg.hidden_input, gpu_state.act_cur);
+            // Warm the expert cache + observe routing so coverage rises (drops -> 0
+            // after warmup) and calibration still accumulates in the fused path.
+            {
+                ggml_backend_tensor_get(layer_sg.moe_selected[0], selected.data(), 0,
+                                        sizeof(int32_t) * selected.size());
+                if (routing_stats_) routing_stats_->observe(il, selected.data(), (int)selected.size());
+                auto & _cst = moe_hybrid_->layers[(size_t)il];
+                if (_cst.cache_slots > 0)
+                    for (int _k = 0; _k < (int)selected.size(); ++_k)
+                        dflash::common::moe_hybrid_cache_swap_in(_cst, selected[(size_t)_k], backend_);
+            }
         } else {
             // MoE layer: read router decisions, then do hybrid FFN eval
             ggml_tensor * sel_tensor = layer_sg.moe_selected[0];
