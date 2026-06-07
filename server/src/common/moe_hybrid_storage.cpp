@@ -7,6 +7,12 @@
 #include <algorithm>
 #include <cstring>
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#else
+#include <windows.h>
+#endif
+
 namespace dflash::common {
 
 void CachedFfnGraph::free() {
@@ -123,6 +129,17 @@ MoeHybridStorage::~MoeHybridStorage() {
     if (cpu_backend) {
         ggml_backend_free(cpu_backend);
         cpu_backend = nullptr;
+    }
+    if (mmap_data) {
+#if !defined(_WIN32)
+        ::munmap(const_cast<void *>(mmap_data), mmap_size);
+#else
+        // On Windows, the mapping is unmapped when the view handle is closed.
+        // mmap_data was mapped via MapViewOfFile; UnmapViewOfFile is the correct cleanup.
+        ::UnmapViewOfFile(mmap_data);
+#endif
+        mmap_data = nullptr;
+        mmap_size = 0;
     }
 }
 
@@ -568,6 +585,62 @@ MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_
         }
     }
     return r;
+}
+
+bool build_moe_hybrid_storage_from_file_with_mmap(
+    const MoeHybridConfig & cfg,
+    ggml_backend_t gpu_backend,
+    const MoeHybridPlacement & placement,
+    const std::vector<MoeLayerDesc> & layer_descs,
+    const std::vector<LayerExpertFileData> & file_data,
+    const void * mmap_base,
+    size_t mmap_total_size,
+    MoeHybridStorage & out,
+    std::string * err) {
+
+    // First build storage normally (hot GPU + cold CPU buffers).
+    if (!build_moe_hybrid_storage_from_file(cfg, gpu_backend, placement, layer_descs, file_data, out, err)) {
+        return false;
+    }
+
+    // Store mmap metadata for streaming prefill.
+    out.mmap_data = mmap_base;
+    out.mmap_size = mmap_total_size;
+
+    // Compute per-layer expert file regions (offsets relative to mmap base).
+    const auto * base = static_cast<const uint8_t *>(mmap_base);
+    out.layer_regions.resize((size_t)cfg.n_layer);
+    for (int il = 0; il < cfg.n_layer; ++il) {
+        const auto & fd = file_data[(size_t)il];
+        auto & reg = out.layer_regions[(size_t)il];
+
+        if (fd.gate_exps.data && fd.gate_exps.size > 0) {
+            reg.gate_exps.offset = (size_t)(fd.gate_exps.data - base);
+            reg.gate_exps.size = fd.gate_exps.size;
+        }
+        if (fd.up_exps.data && fd.up_exps.size > 0) {
+            reg.up_exps.offset = (size_t)(fd.up_exps.data - base);
+            reg.up_exps.size = fd.up_exps.size;
+        }
+        if (fd.down_exps.data && fd.down_exps.size > 0) {
+            reg.down_exps.offset = (size_t)(fd.down_exps.data - base);
+            reg.down_exps.size = fd.down_exps.size;
+        }
+        if (fd.gate_up_exps.data && fd.gate_up_exps.size > 0) {
+            reg.gate_up_exps.offset = (size_t)(fd.gate_up_exps.data - base);
+            reg.gate_up_exps.size = fd.gate_up_exps.size;
+        }
+
+        // Copy per-expert byte sizes from layer storage (already computed)
+        const auto & ls = out.layers[(size_t)il];
+        reg.expert_bytes_gate    = ls.gate_expert_bytes;
+        reg.expert_bytes_up      = ls.up_expert_bytes;
+        reg.expert_bytes_down    = ls.down_expert_bytes;
+        reg.expert_bytes_gate_up = ls.gate_up_expert_bytes;
+        reg.fused_gate_up        = ls.fused_gate_up;
+    }
+
+    return true;
 }
 
 }  // namespace dflash::common

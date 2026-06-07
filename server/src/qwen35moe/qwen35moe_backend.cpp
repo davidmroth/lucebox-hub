@@ -1,6 +1,7 @@
 #include "qwen35moe_backend.h"
 
 #include "../common/moe_hybrid_placement.h"
+#include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
 #include "../common/moe_hybrid_types_impl.h"
 #include "common/ggml_graph_precision.h"
@@ -149,20 +150,41 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         for (int il = 0; il < out.n_layer; ++il) {
             layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
         }
-        int cache_slots = 0;
-    if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
-    else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    if (!build_moe_hybrid_storage_from_file(hybrid_cfg, backend, placement, layer_descs, layer_file_data, *hybrid, &err, cache_slots)) {
+        if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err)) {
             ::munmap(mmap_addr, file_size);
             gguf_free(gctx);
             set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
             return false;
         }
 
-        ::munmap(mmap_addr, file_size);
+        // Keep mmap open for streaming prefill — do NOT munmap here.
+        // The mmap_data/mmap_size are stored in hybrid storage for lifetime management.
         gguf_free(gctx);
 
         out.moe_hybrid = std::move(hybrid);
+    }
+
+    // Initialize streaming engine for prefill (if cold experts exist and mmap is available)
+    if (out.moe_hybrid && out.moe_hybrid->has_mmap() && !out.moe_hybrid->layers.empty()) {
+        // Compute max expert size across all layers
+        size_t max_expert_bytes = 0;
+        for (const auto & layer : out.moe_hybrid->layers) {
+            size_t per_expert = layer.fused_gate_up
+                ? layer.gate_up_expert_bytes + layer.down_expert_bytes
+                : layer.gate_expert_bytes + layer.up_expert_bytes + layer.down_expert_bytes;
+            max_expert_bytes = std::max(max_expert_bytes, per_expert);
+        }
+        if (max_expert_bytes > 0) {
+            std::string stream_err;
+            if (stream_engine_.init(backend, max_expert_bytes, &stream_err)) {
+                std::printf("[qwen35moe] streaming prefill engine ready (pinned=%.1f MiB, scratch=%.1f MiB)\n",
+                            stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
+                            stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
+            } else {
+                std::fprintf(stderr, "[qwen35moe] warning: streaming engine init failed: %s (prefill will use fallback)\n",
+                             stream_err.c_str());
+            }
+        }
     }
 
     int total_cold = 0;
@@ -814,6 +836,27 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             bool ffn_ok = false;
             if (storage.cold_expert_ids.empty()) {
                 // All experts hot — safe to use batched path
+                ffn_ok = eval_moe_hybrid_ffn_batched(
+                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc, &ffn_cold_alloc);
+            } else if (target_weights().moe_hybrid->has_mmap() &&
+                       !target_weights().moe_hybrid->layer_regions.empty() &&
+                       stream_engine_.is_ready() && chunk_len >= 16 &&
+                       !storage.cold_expert_ids.empty()) {
+                // Streaming prefill: batched eval handles hot on GPU + cold on CPU.
+                // The streaming engine's mmap keeps data paged in via madvise.
+                auto * hybrid = target_weights().moe_hybrid.get();
+                const auto & regions = hybrid->layer_regions[(size_t)il];
+                // Prefetch cold expert data from mmap for upcoming layers
+                std::vector<int32_t> cold_ids_copy(storage.cold_expert_ids.begin(),
+                                                   storage.cold_expert_ids.end());
+                stream_engine_.prefetch_cold_experts(hybrid->mmap_data, hybrid->mmap_size,
+                                                    regions, cold_ids_copy.data(),
+                                                    (int)cold_ids_copy.size());
                 ffn_ok = eval_moe_hybrid_ffn_batched(
                         target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
                         chunk_post.data(),

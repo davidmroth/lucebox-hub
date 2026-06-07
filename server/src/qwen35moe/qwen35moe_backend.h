@@ -7,6 +7,7 @@
 #include "qwen35moe_pipelined_decode.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
 
@@ -47,6 +48,7 @@ private:
     bool rebuild_hybrid_from_placement(const MoeHybridPlacement & placement, std::string & err);
     MoeHybridSwapPolicy swap_policy_;
     bool hybrid_telemetry_ = false;
+    MoeHybridStreamEngine stream_engine_;
 
     void maybe_post_request_swap();
     bool load_dynamic_placement(const char * hotness_path,
