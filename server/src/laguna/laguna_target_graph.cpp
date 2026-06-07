@@ -304,6 +304,13 @@ static ggml_tensor * build_laguna_dense_ffn(ggml_context * ctx, ggml_tensor * cu
 static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
                                                   const LagunaTargetLayer & L);
+// Forward decl for the hybrid (offload) MoE block (defined further down).
+static ggml_tensor * build_laguna_moe_block_hybrid(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
+                                                   const LagunaTargetWeights & w,
+                                                   const LagunaTargetLayer & L,
+                                                   const MoeHybridLayerStorage & hot,
+                                                   ggml_tensor * lut_all, ggml_tensor * vld_all,
+                                                   ggml_tensor * sel_all, int moe_idx);
 
 // MoE block: sigmoid router with score-correction bias, sum-normalize selected
 // weights, scale routed combine by expert_weights_scale (=2.5 for Laguna),
@@ -317,15 +324,21 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor
 // bias + sum-norm + ggml_mul_mat_id) is Phase 2.1.
 // DEBUG SWITCH: env DFLASH_LAGUNA_MOE_STUB=1 routes to shared-only stub.
 // Default: full MoE.
-static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_tensor * cur,
+static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                              const LagunaTargetWeights & w,
-                                             const LagunaTargetLayer & L) {
+                                             const LagunaTargetLayer & L,
+                                             const LagunaHybridMoe * hyb = nullptr, int il = 0) {
     static const bool stub = (std::getenv("DFLASH_LAGUNA_MOE_STUB") != nullptr);
     if (stub) {
         ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
         ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);
         ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
         return ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+    }
+    if (hyb && hyb->storage) {
+        return build_laguna_moe_block_hybrid(ctx, gf, cur, w, L,
+            hyb->storage->layers[(size_t)il], hyb->lut_all, hyb->vld_all, hyb->sel_all,
+            il - hyb->dense_lead);
     }
     return build_laguna_moe_block_full(ctx, cur, w, L);
 }
@@ -709,7 +722,8 @@ static ggml_tensor * build_laguna_layer(
     ggml_tensor * attn_mask,
     int kv_start,
     int n_tokens,
-    ggml_tensor * attn_mask_swa)
+    ggml_tensor * attn_mask_swa,
+    const LagunaHybridMoe * hyb = nullptr)
 {
     const LagunaTargetLayer & L = w.layers[il];
     ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
@@ -732,7 +746,7 @@ static ggml_tensor * build_laguna_layer(
     // Dense MLP (layer 0) or sparse MoE+shared (layers 1..n)
     const bool is_dense = (il < w.n_layer_dense_lead);
     cur = is_dense ? build_laguna_dense_ffn(ctx, cur, L)
-                   : build_laguna_moe_block(ctx, cur, w, L);
+                   : build_laguna_moe_block(ctx, gf, cur, w, L, hyb, il);
 
     return ggml_add(ctx, cur, ffn_inp);
 }
@@ -898,7 +912,7 @@ LagunaGraphOutputs build_laguna_graph(
     for (int il = 0; il < w.n_layer; ++il) {
         cur = build_laguna_layer(ctx, gf, w, cache, il, cur,
                                   in.positions, in.attn_mask, in.kv_start, in.n_tokens,
-                                  in.attn_mask_swa);
+                                  in.attn_mask_swa, in.hybrid);
     }
 
     // Final norm + lm_head
@@ -1064,42 +1078,30 @@ bool laguna_step_hybrid(
         mk_swa_cnv = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
     }
 
-    ggml_tensor * cur = ggml_reshape_2d(ctx, ie, w.n_embd, n_tok);
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
     const int n_moe    = w.n_layer - w.n_layer_dense_lead;
-    ggml_tensor * lut_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_moe); ggml_set_input(lut_all);
-    ggml_tensor * vld_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_moe); ggml_set_input(vld_all);
-    ggml_tensor * sel_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_moe);   ggml_set_output(sel_all);
+    LagunaHybridMoe hybm{};
+    hybm.storage    = &hyb;
+    hybm.dense_lead = w.n_layer_dense_lead;
+    hybm.lut_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_moe); ggml_set_input(hybm.lut_all);
+    hybm.vld_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_moe); ggml_set_input(hybm.vld_all);
+    hybm.sel_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used,  n_moe);  ggml_set_output(hybm.sel_all);
 
-    for (int il = 0; il < w.n_layer; ++il) {
-        const LagunaTargetLayer & L = w.layers[(size_t)il];
-        ggml_tensor * a = laguna_rms_norm_mul(ctx, cur, L.attn_norm);
-        const bool is_full = laguna_is_full_attn_layer(w, il);
-        a = build_laguna_attn_block(ctx, gf, w, L, il, a, pp,
-                                    cache.attn_k[il], cache.attn_v[il],
-                                    mk_full_cnv, mk_swa_cnv, kv_start, n_tok, is_full);
-        ggml_tensor * ffn_inp = ggml_add(ctx, a, cur);
-        ggml_tensor * f = laguna_rms_norm_mul(ctx, ffn_inp, L.ffn_norm);
-        const bool is_dense = (il < w.n_layer_dense_lead);
-        if (is_dense) {
-            f = build_laguna_dense_ffn(ctx, f, L);
-        } else {
-            f = build_laguna_moe_block_hybrid(ctx, gf, f, w, L, hyb.layers[(size_t)il],
-                                              lut_all, vld_all, sel_all, il - w.n_layer_dense_lead);
-        }
-        cur = ggml_add(ctx, f, ffn_inp);
-    }
-
-    cur = laguna_rms_norm_mul(ctx, cur, w.out_norm);
-    ggml_tensor * head_in = cur;
-    if (n_tok > 1) {
-        head_in = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1],
-                               (size_t)(n_tok - 1) * cur->nb[1]);
-    }
-    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, head_in);
-    ggml_set_output(logits);
-    ggml_build_forward_expand(gf, logits);
+    // Reuse the shared graph builder (same attention / norm / precision path as
+    // the all-GPU decode); the hybrid descriptor swaps MoE layers to the hot
+    // stack via the per-layer LUTs.
+    LagunaGraphInputs gi{};
+    gi.inp_embed        = ie;
+    gi.positions        = pp;
+    gi.attn_mask        = mk_full_cnv;
+    gi.attn_mask_swa    = mk_swa_cnv;
+    gi.n_tokens         = n_tok;
+    gi.kv_start         = kv_start;
+    gi.output_last_only = true;
+    gi.hybrid           = &hybm;
+    LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w, cache, gi);
+    ggml_tensor * logits = go.logits;
 
     static ggml_gallocr_t galloc_h = nullptr;
     if (!galloc_h) galloc_h = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1143,8 +1145,8 @@ bool laguna_step_hybrid(
             vldbuf[(size_t)mi * n_expert + g] = loc >= 0 ? 1.0f : 0.0f;
         }
     }
-    ggml_backend_tensor_set(lut_all, lutbuf.data(), 0, sizeof(int32_t) * lutbuf.size());
-    ggml_backend_tensor_set(vld_all, vldbuf.data(), 0, sizeof(float) * vldbuf.size());
+    ggml_backend_tensor_set(hybm.lut_all, lutbuf.data(), 0, sizeof(int32_t) * lutbuf.size());
+    ggml_backend_tensor_set(hybm.vld_all, vldbuf.data(), 0, sizeof(float) * vldbuf.size());
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "laguna_step_hybrid: graph_compute failed\n");
@@ -1157,7 +1159,7 @@ bool laguna_step_hybrid(
 
     if (out_selected) {
         std::vector<int32_t> selbuf((size_t)n_used * (size_t)n_moe);
-        ggml_backend_tensor_get(sel_all, selbuf.data(), 0, sizeof(int32_t) * selbuf.size());
+        ggml_backend_tensor_get(hybm.sel_all, selbuf.data(), 0, sizeof(int32_t) * selbuf.size());
         out_selected->assign((size_t)w.n_layer * (size_t)n_used, -1);
         for (int il = w.n_layer_dense_lead; il < w.n_layer; ++il) {
             const int mi = il - w.n_layer_dense_lead;

@@ -220,6 +220,18 @@ bool laguna_snapshot_save(const LagunaTargetCache & cache,
 bool laguna_snapshot_restore(const LagunaCacheSnapshot & snap,
                               LagunaTargetCache &         cache);
 
+struct MoeHybridStorage;  // defined in common/moe_hybrid_storage.h
+// Descriptor that turns the shared graph builders into the hybrid-offload
+// path: MoE layers serve experts from the bounded hot stack via per-layer
+// residency LUTs. storage==null => full all-GPU expert stack (default).
+struct LagunaHybridMoe {
+    const MoeHybridStorage * storage = nullptr;
+    ggml_tensor * lut_all = nullptr;  // [n_expert, n_moe] i32 global->hot-slot (caller-set)
+    ggml_tensor * vld_all = nullptr;  // [n_expert, n_moe] f32 1=resident 0=drop (caller-set)
+    ggml_tensor * sel_all = nullptr;  // [n_used,  n_moe] i32 selected ids (graph writes per layer)
+    int dense_lead = 0;               // moe_idx = il - dense_lead
+};
+
 struct LagunaGraphInputs {
     ggml_tensor * inp_embed;      // [n_embd, n_tokens, 1] f32 (CPU-embedded by caller)
     ggml_tensor * positions;      // [n_tokens] i32 (NeoX rope; not M-RoPE)
@@ -232,6 +244,7 @@ struct LagunaGraphInputs {
     // If true, lm_head only runs on the LAST token (saves ~6 GB of logit memory
     // at n_tokens=16K, vocab=100352). Standard TTFT optimization.
     bool          output_last_only = false;
+    const LagunaHybridMoe * hybrid = nullptr;  // non-null => hybrid-offload MoE path
 };
 
 struct LagunaGraphOutputs {
