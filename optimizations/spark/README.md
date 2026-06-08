@@ -11,24 +11,32 @@
 <p align="center">
   <strong>Run a big MoE on a smaller GPU by keeping only the active units lit.</strong><br/>
   Calibrate which experts stay hot from real traffic, swap the rest through a bounded GPU cache.<br/>
-  Laguna-XS.2 (3B active / <strong>33B total</strong>) on a single RTX 3090: <strong>85-88 tok/s on 14.6 GiB</strong>,<br/>
-  vs 66 tok/s for naive offload and 111 tok/s for the full model at 18.8 GiB.<br/><br/>
+  Laguna-XS.2 (3B active / <strong>33B total</strong>) on a single RTX 3090: a 33B-total MoE in <strong>14.6 GiB</strong>,<br/>
+  decoding at <strong>~100 tok/s</strong> with one fused graph, near the <strong>119 tok/s all-GPU ceiling</strong>, vs 66 for naive offload.<br/><br/>
   <a href="https://lucebox.com">lucebox.com</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a>
 </p>
 
 ---
 
 ```
-Laguna-XS.2 Q4_K_M (33B total MoE) · RTX 3090 · held-out Claude Code sessions
+Laguna-XS.2 Q4_K_M (33B total MoE) · RTX 3090 · decode at 60% residency
 
-                          tok/s   % all-GPU   cold-hit   VRAM
-  all on GPU               111       100%        -       18.8 GiB
-  naive offload 60%         66        59%        36%      10.6 GiB
-  Spark calibrated 60%      81        73%       6.6%      10.6 GiB
-  Spark + expert cache      88        79%       ~0%       14.6 GiB
+                                tok/s   % all-GPU
+  all on GPU (needs >16 GB)      119       100%
+  naive offload (uniform)         66        55%
+  Spark, calibrated               81        68%
+  Spark + cache + fused decode    100        85%
+
+  reproduce: python -m spark.bench --bin ../../server/build/test_dflash ...
 ```
 
 > A 33B-total mixture-of-experts only fires ~8 of 256 experts per token, but a naive hot/cold offload still pays for it: pick the wrong experts to keep resident and you hit the CPU tier a third of the time. Spark exploits **activation sparsity** as a product: it calibrates the hot set from the traffic you actually serve, then a bounded GPU cache swaps the long tail in and out so cold-misses fall to ~zero, all inside a fixed VRAM budget.
+
+<p align="center">
+  <img src="demo.gif" width="760" alt="Naive expert offload vs Luce Spark: same 33B MoE, same RTX 3090, same 60% GPU residency, same output. Spark decodes at 100 tok/s vs 66 for naive offload." />
+</p>
+
+<p align="center"><sub>Same model, same card, same 60% residency, same output. Spark finishes first: 66 to 100 tok/s, 1.5x the decode.</sub></p>
 
 ## What Spark is
 
@@ -47,10 +55,14 @@ actually fast on a small card:
    first use (LRU evict) and serves them on-GPU afterward. The distinct cold set
    saturates within a session, so a small cache drives cold-misses to ~0 and
    recovers most of the remaining gap (**81 → 88 tok/s**) without growing VRAM.
-3. **A pre-gate predictor (research).** The last ~20% to all-GPU needs the
-   per-layer graphs fused, which needs experts known one step early. We capture
-   routing traces and train a predictor; the finding (below) is that this needs
-   a model fine-tune, not a fitted predictor.
+3. **Per-token fused decode.** Under offload the engine was building 40 separate
+   per-layer GPU graphs per token; that submission overhead, not where the experts
+   live, was the remaining gap. Spark folds the routed FFN into the attention graph
+   and runs the whole token as **one fused graph** (`laguna_step_hybrid`, default-on):
+   **bit-identical to all-GPU at full residency (119 tok/s)** and **~100 tok/s at
+   60% residency** on the decode bench. Closing the last ~15% needs the next experts
+   known one step early; token-level prediction caps near **53% recall**, so that
+   part stays open research, not a shipped win.
 
 It generalizes beyond experts: the same hot/cold residency applies to
 fine-grain neuron sparsity (Deja Vu / PowerInfer style). MoE experts are the
@@ -70,7 +82,13 @@ Code sessions, validated on 60 held-out sessions.
 | **Spark + cache (32 slots)** | **85-88** | ~79% | ~0% | **14.6 GiB** |
 
 Peak VRAM at the operating point (60% hot + 32 cache slots) measured at
-**14.59 GiB** — a 33B-total MoE at ~85-88 tok/s, under 16 GiB.
+**14.59 GiB**: a 33B-total MoE under 16 GiB.
+
+On the fixed decode bench ([`spark/bench.py`](spark/bench.py)) the per-token fused
+decode reaches **~100 tok/s at 60% residency** and is **bit-identical to all-GPU**
+(128/128 tokens, 119 tok/s) at full residency. The held-out real-session numbers
+above are the harder, more representative figure; the fused-decode bench is the
+reproducible ceiling the race GIF shows.
 
 ## How it works
 
