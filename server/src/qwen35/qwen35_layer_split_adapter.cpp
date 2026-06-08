@@ -727,6 +727,7 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
     ggml_tensor * dflash_feature_data = nullptr;
     Qwen35TargetShardSnapshotData remote_import;
     int max_remote_shard = -1;
+    std::vector<int> remote_tensor_counts;
     if (mixed_target_split) {
         remote_import.cur_pos = cur_pos;
         remote_import.last_tok = last_tok;
@@ -823,6 +824,10 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
                     ggml_backend_tensor_get(t, remote_tensor.data.data(), 0, nbytes);
                     remote_import.tensors.push_back(std::move(remote_tensor));
                     max_remote_shard = std::max(max_remote_shard, remote_shard);
+                    if (remote_shard >= (int)remote_tensor_counts.size()) {
+                        remote_tensor_counts.resize((size_t)remote_shard + 1, 0);
+                    }
+                    remote_tensor_counts[(size_t)remote_shard]++;
                 }
             }
         }
@@ -863,6 +868,12 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
             return fail();
         }
         remote_import.shard_count = max_remote_shard + 1;
+        if (remote_tensor_counts.size() != (size_t)remote_import.shard_count) {
+            return fail();
+        }
+        for (int count : remote_tensor_counts) {
+            if (count <= 0) return fail();
+        }
         remote_import.logits = snapshot_prefill_logits_[(size_t)slot];
         if (!remote_target_shard_.snapshot_import(slot, remote_import)) {
             return fail();
