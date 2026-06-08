@@ -796,8 +796,9 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                         free_prefix_snapshot(snap);
                     }
                     if (consumed_payload_bytes < payload_bytes) {
-                        ok = drain_exact_fd(
+                        const bool drained = drain_exact_fd(
                             payload_fd, payload_bytes - consumed_payload_bytes);
+                        if (!drained) break;
                     }
                 }
                 stream_status(stream_fd, ok ? 0 : -1);
