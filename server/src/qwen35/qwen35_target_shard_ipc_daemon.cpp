@@ -681,21 +681,30 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 table.resize((size_t)n_tensors);
                 std::vector<int> tensor_counts(shards.size(), 0);
                 uint64_t payload_bytes = 0;
-                for (int i = 0; ok && i < n_tensors; ++i) {
-                    ok = read_snapshot_tensor_header_fd(
-                        payload_fd, table[(size_t)i]) &&
-                        table[(size_t)i].shard >= 0 &&
-                        table[(size_t)i].shard < shard_count &&
-                        table[(size_t)i].nbytes <=
+                bool headers_read = true;
+                for (int i = 0; i < n_tensors; ++i) {
+                    auto & entry = table[(size_t)i];
+                    if (!read_snapshot_tensor_header_fd(payload_fd, entry)) {
+                        headers_read = false;
+                        ok = false;
+                        break;
+                    }
+                    const bool valid =
+                        entry.shard >= 0 &&
+                        entry.shard < shard_count &&
+                        entry.nbytes <=
                             (uint64_t)std::numeric_limits<size_t>::max() &&
                         payload_bytes <=
                             std::numeric_limits<uint64_t>::max() -
-                            table[(size_t)i].nbytes;
-                    if (ok) {
-                        tensor_counts[(size_t)table[(size_t)i].shard]++;
-                        payload_bytes += table[(size_t)i].nbytes;
+                                entry.nbytes;
+                    if (!valid) {
+                        ok = false;
+                        continue;
                     }
+                    tensor_counts[(size_t)entry.shard]++;
+                    payload_bytes += entry.nbytes;
                 }
+                if (!headers_read) break;
                 ok = ok && payload_bytes <=
                                std::numeric_limits<uint64_t>::max() -
                                    (uint64_t)logits_count * sizeof(float);
@@ -756,33 +765,41 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
 
                 std::vector<uint8_t> tmp(4 * 1024 * 1024);
                 uint64_t consumed_payload_bytes = 0;
+                bool payload_read = true;
                 if (ok) {
                     for (auto & entry : table) {
                         size_t offset = 0;
                         const size_t nbytes = (size_t)entry.nbytes;
                         while (ok && offset < nbytes) {
                             const size_t chunk = std::min(tmp.size(), nbytes - offset);
-                            ok = read_exact_fd(payload_fd, tmp.data(), chunk);
-                            if (ok) {
-                                ggml_backend_tensor_set(
-                                    entry.tensor, tmp.data(), offset, chunk);
+                            if (!read_exact_fd(payload_fd, tmp.data(), chunk)) {
+                                payload_read = false;
+                                ok = false;
+                                break;
                             }
+                            ggml_backend_tensor_set(
+                                entry.tensor, tmp.data(), offset, chunk);
                             offset += chunk;
                             consumed_payload_bytes += chunk;
                         }
                     }
                 }
+                if (!payload_read) break;
 
                 std::vector<float> imported_logits;
                 if (ok) {
                     imported_logits.assign((size_t)logits_count, 0.0f);
-                    ok = read_exact_fd(payload_fd, imported_logits.data(),
-                                       sizeof(float) * imported_logits.size());
-                    if (ok) {
-                        consumed_payload_bytes +=
-                            (uint64_t)sizeof(float) * imported_logits.size();
+                    const size_t logits_bytes =
+                        sizeof(float) * imported_logits.size();
+                    if (!read_exact_fd(payload_fd, imported_logits.data(),
+                                       logits_bytes)) {
+                        payload_read = false;
+                        ok = false;
+                    } else {
+                        consumed_payload_bytes += (uint64_t)logits_bytes;
                     }
                 }
+                if (!payload_read) break;
                 for (size_t shard_idx = 0; ok && shard_idx < shards.size(); ++shard_idx) {
                     ok = validate_snapshot_tensors(
                         imported[shard_idx], shards[shard_idx].cache);
