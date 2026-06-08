@@ -89,6 +89,21 @@ bool read_snapshot_tensor_header_fd(int fd, IpcSnapshotTensor & t) {
     return true;
 }
 
+bool drain_exact_fd(int fd, uint64_t bytes) {
+    if (fd < 0) return false;
+    std::vector<uint8_t> tmp(4 * 1024 * 1024);
+    uint64_t done = 0;
+    while (done < bytes) {
+        const size_t chunk = (size_t)std::min<uint64_t>(
+            (uint64_t)tmp.size(), bytes - done);
+        if (!read_exact_fd(fd, tmp.data(), chunk)) {
+            return false;
+        }
+        done += chunk;
+    }
+    return true;
+}
+
 bool bind_snapshot_tensor(PrefixSnapshot & snap,
                           const TargetCache & cache,
                           ggml_tensor * tensor) {
@@ -657,33 +672,45 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                           shard_count == (int)shards.size() &&
                           n_tensors > 0 &&
                           logits_count > 0;
+                if (!stream_status(stream_fd, ok ? 0 : -1)) break;
+                if (!ok) {
+                    continue;
+                }
+
                 std::vector<IpcSnapshotTensor> table;
-                if (ok) {
-                    table.resize((size_t)n_tensors);
-                    std::vector<int> tensor_counts(shards.size(), 0);
-                    for (int i = 0; ok && i < n_tensors; ++i) {
-                        ok = read_snapshot_tensor_header_fd(
-                            payload_fd, table[(size_t)i]) &&
-                            table[(size_t)i].shard >= 0 &&
-                            table[(size_t)i].shard < shard_count &&
-                            table[(size_t)i].nbytes <=
-                                (uint64_t)std::numeric_limits<size_t>::max();
-                        if (ok) {
-                            tensor_counts[(size_t)table[(size_t)i].shard]++;
-                        }
+                table.resize((size_t)n_tensors);
+                std::vector<int> tensor_counts(shards.size(), 0);
+                uint64_t payload_bytes = 0;
+                for (int i = 0; ok && i < n_tensors; ++i) {
+                    ok = read_snapshot_tensor_header_fd(
+                        payload_fd, table[(size_t)i]) &&
+                        table[(size_t)i].shard >= 0 &&
+                        table[(size_t)i].shard < shard_count &&
+                        table[(size_t)i].nbytes <=
+                            (uint64_t)std::numeric_limits<size_t>::max() &&
+                        payload_bytes <=
+                            std::numeric_limits<uint64_t>::max() -
+                            table[(size_t)i].nbytes;
+                    if (ok) {
+                        tensor_counts[(size_t)table[(size_t)i].shard]++;
+                        payload_bytes += table[(size_t)i].nbytes;
                     }
-                    for (int count : tensor_counts) {
-                        if (count <= 0) ok = false;
-                    }
+                }
+                ok = ok && payload_bytes <=
+                               std::numeric_limits<uint64_t>::max() -
+                                   (uint64_t)logits_count * sizeof(float);
+                payload_bytes += (uint64_t)logits_count * sizeof(float);
+                for (int count : tensor_counts) {
+                    if (count <= 0) ok = false;
+                }
+                if (!stream_status(stream_fd, ok ? 0 : -1)) break;
+                if (!ok) {
+                    continue;
                 }
 
                 std::vector<PrefixSnapshot> imported;
                 if (ok) {
                     imported.resize(shards.size());
-                    std::vector<int> tensor_counts(shards.size(), 0);
-                    for (const auto & entry : table) {
-                        tensor_counts[(size_t)entry.shard]++;
-                    }
                     for (size_t shard_idx = 0; ok && shard_idx < shards.size(); ++shard_idx) {
                         auto & snap = imported[shard_idx];
                         snap.attn_k_snap.assign(shards[shard_idx].cache.attn_k.size(), nullptr);
@@ -728,6 +755,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 }
 
                 std::vector<uint8_t> tmp(4 * 1024 * 1024);
+                uint64_t consumed_payload_bytes = 0;
                 if (ok) {
                     for (auto & entry : table) {
                         size_t offset = 0;
@@ -740,6 +768,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                     entry.tensor, tmp.data(), offset, chunk);
                             }
                             offset += chunk;
+                            consumed_payload_bytes += chunk;
                         }
                     }
                 }
@@ -749,6 +778,10 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                     imported_logits.assign((size_t)logits_count, 0.0f);
                     ok = read_exact_fd(payload_fd, imported_logits.data(),
                                        sizeof(float) * imported_logits.size());
+                    if (ok) {
+                        consumed_payload_bytes +=
+                            (uint64_t)sizeof(float) * imported_logits.size();
+                    }
                 }
                 for (size_t shard_idx = 0; ok && shard_idx < shards.size(); ++shard_idx) {
                     ok = validate_snapshot_tensors(
@@ -761,6 +794,10 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 } else {
                     for (auto & snap : imported) {
                         free_prefix_snapshot(snap);
+                    }
+                    if (consumed_payload_bytes < payload_bytes) {
+                        ok = drain_exact_fd(
+                            payload_fd, payload_bytes - consumed_payload_bytes);
                     }
                 }
                 stream_status(stream_fd, ok ? 0 : -1);
