@@ -70,6 +70,10 @@ COPY server/src /src/server/src
 COPY server/test /src/server/test
 COPY server/hip_compat /src/server/hip_compat
 COPY server/deps /src/server/deps
+# status.html: dflash_server's POST_BUILD copies server/share/status.html into
+# build/share/ (server/CMakeLists.txt). Without this COPY the build links the
+# server then dies on the missing source file.
+COPY server/share /src/server/share
 
 # Submodules (`server/deps/llama.cpp`, `server/deps/Block-Sparse-Attention`)
 # must be populated on the host before `docker build` — `.git/` is excluded
