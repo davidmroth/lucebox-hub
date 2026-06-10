@@ -61,11 +61,16 @@ on:
         type: boolean
         default: false
 
-# Single in-flight build per ref. New pushes cancel the previous run so we
-# don't queue 30-min compiles.
+# Single in-flight build per ref. PR pushes cancel the previous run so we
+# don't queue 30-min compiles on every force-push. Main publishes QUEUE
+# instead: with cancel-in-progress on main, any merge during the ~2 h
+# fat-binary build kills the in-flight publish, and on an active merge day
+# no publish ever completes (and the layer cache, written only on success,
+# never lands) — the rolling tags starve. A queued main run is superseded
+# by the next queued one, so at most one stale publish runs to completion.
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -184,6 +189,12 @@ jobs:
           # dispatch builds keep the full consumer-GPU list so the published
           # image runs on every supported card.
           DFLASH_CUDA_ARCHES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;89;90;120' }}
+          # Same split for HIP: PR builds compile gfx1151 only (the verified
+          # reference, Strix Halo); main / release builds widen to consumer
+          # RDNA so the published :rocm runs on RX 7900 (gfx1100) and RDNA4
+          # (gfx1200) too. CDNA datacenter parts (gfx90a/gfx942) stay out
+          # until someone can test them.
+          DFLASH_HIP_ARCHES: ${{ github.event_name == 'pull_request' && 'gfx1151' || 'gfx1151;gfx1100;gfx1200' }}
         with:
           files: |
             docker-bake.hcl
