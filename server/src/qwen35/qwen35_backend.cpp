@@ -716,6 +716,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         return result;
     }
 
+    // Clear-then-restore: the step-invariant decode reads a 256-padded,
+    // mask-less FA span, so rows beyond the restored prefix must be ZERO,
+    // not leftovers from the previous request. cudaMemset is ~0.2ms.
+    if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
+
     // Restore snapshot
     restore_target_cache(prefix_snapshots_[slot], cache_);
 
