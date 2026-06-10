@@ -292,6 +292,7 @@ add_library(dflash_common STATIC
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
     src/server/disk_prefix_cache.cpp
+    src/server/freeze_history.cpp
     # ── Jinja chat-template engine (from llama.cpp common/jinja/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file
     # in dflash_server. Mirrors llama.cpp's common_chat_template plumbing.

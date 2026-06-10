@@ -60,13 +60,16 @@ const char * disk_prefix_cache_mode_name(DiskPrefixCacheMode mode) {
 }
 
 std::string disk_prefix_cache_policy_name(const DiskPrefixCachePolicy & policy) {
+    std::string base;
     if (policy.mode == DiskPrefixCacheMode::Fixed) {
-        return "fixed:" + std::to_string(policy.fixed_tokens);
+        base = "fixed:" + std::to_string(policy.fixed_tokens);
+    } else if (policy.mode == DiskPrefixCacheMode::Auto) {
+        base = "auto:" + std::to_string(policy.auto_window);
+    } else {
+        base = disk_prefix_cache_mode_name(policy.mode);
     }
-    if (policy.mode == DiskPrefixCacheMode::Auto) {
-        return "auto:" + std::to_string(policy.auto_window);
-    }
-    return disk_prefix_cache_mode_name(policy.mode);
+    if (policy.compress) base += "+compress";
+    return base;
 }
 
 bool parse_disk_prefix_cache_policy(const std::string & value,
