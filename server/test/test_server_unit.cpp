@@ -1471,7 +1471,7 @@ static void test_draft_residency_pflash_auto() {
             /*low_vram_hint=*/false,
             /*has_decode_draft=*/false,
         });
-    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
 
     action = resolve_draft_residency_action(
         DraftResidencyPolicy::Auto,
