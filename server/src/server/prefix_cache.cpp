@@ -261,6 +261,21 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
         has_pending_evict_ = false;
     }
 
+    // The new snapshot replaces whatever this slot previously held. Drop any
+    // other entries still pointing at the slot: their hashes describe a
+    // different (or shorter) token stream than the new snapshot, and a later
+    // restore through them would attach mismatched KV. Stale entries arise
+    // when an aborted snap burns a round-robin next_slot_ step and a later
+    // confirm wraps onto a slot with a live entry (PR #370 repro).
+    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
+        if (entries_[(size_t)i].slot == slot) {
+            std::fprintf(stderr,
+                "[pc] dropping stale entry for reused slot=%d\n", slot);
+            entries_.erase(entries_.begin() + i);
+            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     entries_.push_back({key, slot});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
@@ -366,6 +381,15 @@ void PrefixCache::confirm_full_snap(int slot,
             full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
         }
         full_has_pending_evict_ = false;
+    }
+
+    for (int i = (int)full_entries_.size() - 1; i >= 0; --i) {
+        if (full_entries_[(size_t)i].entry.slot == slot) {
+            std::fprintf(stderr,
+                "[pc] dropping stale full-cache entry for reused slot=%d\n", slot);
+            full_entries_.erase(full_entries_.begin() + i);
+            full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
     auto key = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
