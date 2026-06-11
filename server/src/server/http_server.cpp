@@ -4,6 +4,7 @@
 // job queue, worker thread with SSE streaming and disconnect detection.
 
 #include "http_server.h"
+#include "admission.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
@@ -1643,9 +1644,22 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     }
 
     // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
-        send_error(fd, 400, "prompt + max_tokens exceeds context window");
-        return true;
+    // When compression is enabled the effective (post-compress) size is the
+    // real gate; we let oversized requests through so compression can run.
+    // The downstream post-compress guard (after FlowKV/pFlash) enforces the
+    // hard limit on the reduced prompt.
+    {
+        const int n_prompt = (int)req.prompt_tokens.size();
+        const bool pflash_will_run =
+            (config_.pflash_mode != ServerConfig::PflashMode::OFF) &&
+            (drafter_tokenizer_ != nullptr) &&
+            (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+             n_prompt >= config_.pflash_threshold);
+        if (should_reject_oversized(n_prompt, req.max_output,
+                                    config_.max_ctx, pflash_will_run)) {
+            send_error(fd, 400, "prompt + max_tokens exceeds context window");
+            return true;
+        }
     }
 
     std::fprintf(stderr,
@@ -2168,6 +2182,15 @@ void HttpServer::worker_loop() {
                     }
                 }
             }
+        }
+
+        // Post-compress effective-size gate.
+        // Applies after FlowKV/pFlash have had a chance to reduce the prompt.
+        // If compression ran but still couldn't bring the effective prompt
+        // within the window, reject cleanly rather than silently overflowing KV.
+        if ((int)effective_prompt.size() + req.max_output > config_.max_ctx) {
+            fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
+            continue;
         }
 
         // ── Upstream proxy: forward to remote server if configured ────
