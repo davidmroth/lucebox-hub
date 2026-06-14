@@ -1416,47 +1416,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
-        // Budget tail-off: when remaining budget is within the spec-decode
-        // batch size of the force-close threshold, hand off to AR for the
-        // tail. AR handles the close-token override cleanly; spec-decode's
-        // verify-and-accept loop can't safely inject a token mid-batch
-        // without a KV-state rewrite.
-        //
-        // IMPORTANT: cache_.last_tok is set during do_prefill (line 701)
-        // and NEVER updated by the spec-decode commit loop — local
-        // `last_tok` here is the authoritative most-recently-committed
-        // token. Sync it into cache_.last_tok before handing off so AR's
-        // `first_tok = cache_.last_tok` seed is correct. Without this
-        // sync, AR would re-seed from the prefill's last argmax (stale
-        // by `n_generated` positions) and produce garbage continuation.
-        if (budget_hook && !budget_hook->close_token_ids.empty()) {
-            int hard = budget_hook->hard_limit_remaining;
-            // Tail when remaining <= hard + one spec-decode batch worth of
-            // headroom. Ensures the force-close fires within the AR tail
-            // rather than after a final spec-decode batch overshoots.
-            if (need_commit_budget <= hard + q_len) {
-                std::fprintf(stderr,
-                    "[budget-hook] spec-decode tail-off at committed=%d/%d "
-                    "(remaining=%d, hard_limit=%d, batch=%d) — switching to AR\n",
-                    committed, n_gen, need_commit_budget, hard, q_len);
-                step_graph_destroy(draft_sg);
-                cache_.last_tok = last_tok;  // sync spec-decode → AR seed
-                // Build a fresh hook keyed off this call's local n_gen
-                // (the remaining decode budget) so force-close fires once
-                // remaining <= hard_limit relative to AR's loop counter,
-                // not relative to the global decode budget. Without this
-                // remap force-close would either fire on every iter
-                // (negative remaining_for_hook) or never (positive but
-                // misscaled).
-                BudgetHook tail_hook = *budget_hook;
-                int ar_n_gen = need_commit_budget;
-                bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                        tail_hook, forced_close_out,
-                                        degenerate_close_out);
-                io.emit(-1);
-                return ok;
-            }
-        }
+        // Budget hook: no tail-off here. The close-token injection fires
+        // during the emit phase (step 8) after acceptance+replay, mirroring
+        // the existing floor_to_ar pattern. This keeps spec-decode active
+        // through the close boundary instead of tearing down to AR early.
 
         if (last_tok < 0 && !out_tokens.empty()) {
             std::fprintf(stderr,
@@ -1633,6 +1596,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         bool hit_eos = false;
         bool floor_to_ar = false;
         bool inject_tool_prefix = false;
+        bool budget_close_fired = false;
         constexpr size_t kActionSuffixLookback = 16;
         constexpr size_t kSkipSequenceLookback = 64;
         int emitted = 0;
@@ -1668,10 +1632,38 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     break;
                 }
             }
+            // Budget hook: check if remaining budget has hit the force-close
+            // threshold. Override this token with close_token_ids[0] and stop
+            // emitting — AR handles the rest via maybe_force_close.
+            if (budget_hook && !budget_hook->close_token_ids.empty() &&
+                !budget_close_fired)
+            {
+                const int generated_now = n_generated + emitted;
+                int remaining = n_gen - generated_now;
+                if (remaining <= budget_hook->hard_limit_remaining) {
+                    int32_t first_close = budget_hook->close_token_ids.front();
+                    if (replay_tok[i] == first_close) {
+                        // Model self-closed at the boundary; consume as
+                        // start of close sequence (no override needed).
+                        budget_close_fired = true;
+                    } else {
+                        // Force-close: override sampled token with close[0].
+                        replay_tok[i] = first_close;
+                        budget_close_fired = true;
+                        if (forced_close_out) *forced_close_out = true;
+                    }
+                    std::fprintf(stderr,
+                        "[budget-hook] spec-decode close at committed=%d/%d "
+                        "(remaining=%d <= hard_limit=%d)\n",
+                        committed + emitted, n_gen, remaining,
+                        budget_hook->hard_limit_remaining);
+                }
+            }
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
             if (io.cancelled) break;
+            if (budget_close_fired) break;
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
         int injected = 0;
@@ -1741,6 +1733,47 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return true;
             }
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
+            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                    tail_hook, forced_close_out,
+                                    degenerate_close_out);
+            io.emit(-1);
+            return ok;
+        }
+        // Budget hook close: close token was emitted during the emit phase.
+        // Roll back KV to pre-replay state and replay only the overridden
+        // prefix (including the close token) so KV stays consistent with
+        // the emitted output before AR takes over.
+        if (budget_close_fired) {
+            if (!target->restore_kv()) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            cache_.cur_pos = committed;
+            if (emitted > 0) {
+                std::vector<int32_t> replay_prefix(replay_tok.begin(),
+                                                   replay_tok.begin() + emitted);
+                int prefix_last_tok = -1;
+                if (!target->verify_batch(replay_prefix, committed,
+                                          prefix_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: budget-close prefix replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+            committed += emitted;
+            cache_.cur_pos = committed;
+            step_graph_destroy(draft_sg);
+            cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
+            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+            out_accept_rate =
+                (float)((double)n_accept_sum / (double)total_draft_pos);
+            const int ar_n_gen = n_gen - n_generated;
+            if (ar_n_gen <= 0) {
+                io.emit(-1);
+                return true;
+            }
+            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
+            tail_hook.close_token_ids.clear();
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
