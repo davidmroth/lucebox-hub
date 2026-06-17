@@ -268,7 +268,7 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
-| `--fa-window N` | `0` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls on Qwen3.6 (the full-attention layers lose the system prompt/tools). Advanced / long-context only. |
+| `--fa-window N` | `0` / `2048` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls (the full-attention layers lose the system prompt/tools). |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
