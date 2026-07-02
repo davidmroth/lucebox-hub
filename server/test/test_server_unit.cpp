@@ -20,6 +20,7 @@
 #include "common/sampler.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/moe_hybrid_ffn_eval.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
@@ -48,6 +49,14 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+
+#if defined(_WIN32)
+#define dflash_setenv(name, value) _putenv_s(name, value)
+#define dflash_unsetenv(name) _putenv_s(name, "")
+#else
+#define dflash_setenv(name, value) setenv(name, value, 1)
+#define dflash_unsetenv(name) unsetenv(name)
+#endif
 
 using json = nlohmann::json;
 using namespace dflash::common;
@@ -684,7 +693,7 @@ static void test_parse_call_verb_cleaned_text() {
 }
 
 static void test_parse_call_verb_intercept_inner_json() {
-    // Codex-requested: inner args of the form {"name": ..., "arguments": ...}
+    // Regression case: inner args of the form {"name": ..., "arguments": ...}
     // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
     // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
     // inner JSON intact in its arguments.
@@ -2999,6 +3008,17 @@ static void test_backend_ipc_payload_pipe_round_trip() {
 }
 
 static void test_backend_ipc_payload_transport_parse() {
+    BackendIpcMode mode = BackendIpcMode::DFlashDraft;
+    TEST_ASSERT(parse_backend_ipc_mode("dflash-draft", mode));
+    TEST_ASSERT(mode == BackendIpcMode::DFlashDraft);
+    TEST_ASSERT(parse_backend_ipc_mode("pflash-compress", mode));
+    TEST_ASSERT(mode == BackendIpcMode::PFlashCompress);
+    TEST_ASSERT(parse_backend_ipc_mode("qwen35-target-shard", mode));
+    TEST_ASSERT(mode == BackendIpcMode::Qwen35TargetShard);
+    TEST_ASSERT(parse_backend_ipc_mode("moe-expert-compute", mode));
+    TEST_ASSERT(mode == BackendIpcMode::MoeExpertCompute);
+    TEST_ASSERT(!parse_backend_ipc_mode("moe-ffn", mode));
+
     BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Auto;
     TEST_ASSERT(parse_backend_ipc_payload_transport("stream", transport));
     TEST_ASSERT(transport == BackendIpcPayloadTransport::Stream);
@@ -3038,6 +3058,60 @@ static void test_backend_ipc_shared_payload_map_sizing() {
 
     TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
         std::numeric_limits<size_t>::max(), map_bytes));
+}
+
+static void test_backend_ipc_shared_payload_segment_contract() {
+    const BackendIpcPayloadSegment a{reinterpret_cast<const void *>(1), 16};
+    const BackendIpcPayloadSegment b{reinterpret_cast<const void *>(2), 32};
+    const BackendIpcPayloadSegment segments[] = {a, b};
+    size_t total = 0;
+    for (const BackendIpcPayloadSegment & segment : segments) {
+        TEST_ASSERT(backend_ipc_checked_add_size(total, segment.bytes, total));
+    }
+    TEST_ASSERT(total == 48);
+    TEST_ASSERT(backend_ipc_payload_in_bounds(0, total, 48));
+    TEST_ASSERT(!backend_ipc_payload_in_bounds(0, total + 1, 48));
+}
+
+static void test_moe_hybrid_expert_compute_batch_default() {
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH");
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX");
+    TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
+}
+
+static void test_moe_hybrid_expert_compute_ipc_mode_batch_limit() {
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 1024);
+
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
+
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
+
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 32);
+
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+}
+
+static void test_moe_hybrid_prefill_hot_sub_batch_limit() {
+    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
+
+    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "0");
+    TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
+
+    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "3");
+    TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 3);
+
+    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "8");
+    TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
+
+    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4412,13 +4486,11 @@ int main() {
     RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
     RUN_TEST(test_backend_ipc_payload_transport_parse);
     RUN_TEST(test_backend_ipc_payload_bounds);
-
-    std::fprintf(stderr, "\n── Backend IPC ──\n");
-    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
-    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
-    RUN_TEST(test_backend_ipc_payload_transport_parse);
-    RUN_TEST(test_backend_ipc_payload_bounds);
     RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
+    RUN_TEST(test_backend_ipc_shared_payload_segment_contract);
+    RUN_TEST(test_moe_hybrid_expert_compute_batch_default);
+    RUN_TEST(test_moe_hybrid_expert_compute_ipc_mode_batch_limit);
+    RUN_TEST(test_moe_hybrid_prefill_hot_sub_batch_limit);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);

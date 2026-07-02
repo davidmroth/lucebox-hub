@@ -187,6 +187,95 @@ float get_f32_or(const gguf_context * g, const char * key, float fallback) {
     if (id < 0) return fallback;
     return gguf_get_val_f32(g, id);
 }
+
+int read_target_layer_scales(const gguf_context * gctx,
+                             const uint8_t * file_bytes,
+                             size_t file_len,
+                             size_t data_start,
+                             TargetWeights & out) {
+    if (!gctx || !file_bytes || file_len == 0) return 0;
+
+    auto read_scale = [&](int il, const char * base) -> float {
+        char sname[128];
+        // Try "base.scale" first (LibertAI), then "base.weight.scale" (heretic).
+        std::snprintf(sname, sizeof(sname), "blk.%d.%s.scale", il, base);
+        int64_t stid = gguf_find_tensor(gctx, sname);
+        if (stid < 0) {
+            std::snprintf(sname, sizeof(sname), "blk.%d.%s.weight.scale", il, base);
+            stid = gguf_find_tensor(gctx, sname);
+        }
+        if (stid < 0) return 1.0f;
+        const size_t srel = gguf_get_tensor_offset(gctx, stid);
+        if (!gguf_tensor_in_file(data_start, srel, sizeof(float), file_len)) return 1.0f;
+        float val;
+        std::memcpy(&val, file_bytes + data_start + srel, sizeof(float));
+        return val;
+    };
+
+    int n_scales = 0;
+    for (int il = 0; il < out.n_layer; il++) {
+        TargetLayer & L = out.layers[(size_t)il];
+        L.w_gate_s     = read_scale(il, "ffn_gate");
+        L.w_up_s       = read_scale(il, "ffn_up");
+        L.w_down_s     = read_scale(il, "ffn_down");
+        L.wq_s         = read_scale(il, "attn_q");
+        L.wk_s         = read_scale(il, "attn_k");
+        L.wv_s         = read_scale(il, "attn_v");
+        L.wo_s         = read_scale(il, "attn_output");
+        L.wqkv_s       = read_scale(il, "attn_qkv");
+        L.wqkv_gate_s  = read_scale(il, "attn_gate");
+        L.ssm_beta_s   = read_scale(il, "ssm_beta");
+        L.ssm_alpha_s  = read_scale(il, "ssm_alpha");
+        L.ssm_out_s    = read_scale(il, "ssm_out");
+        L.ffn_gate_inp_s       = read_scale(il, "ffn_gate_inp");
+        L.ffn_gate_exps_s      = read_scale(il, "ffn_gate_exps");
+        L.ffn_up_exps_s        = read_scale(il, "ffn_up_exps");
+        L.ffn_down_exps_s      = read_scale(il, "ffn_down_exps");
+        L.ffn_gate_up_exps_s   = read_scale(il, "ffn_gate_up_exps");
+        L.ffn_gate_inp_shexp_s = read_scale(il, "ffn_gate_inp_shexp");
+        L.ffn_gate_shexp_s     = read_scale(il, "ffn_gate_shexp");
+        L.ffn_up_shexp_s       = read_scale(il, "ffn_up_shexp");
+        L.ffn_down_shexp_s     = read_scale(il, "ffn_down_shexp");
+
+        auto count_s = [&](float s) { if (s != 1.0f) n_scales++; };
+        count_s(L.w_gate_s);   count_s(L.w_up_s);   count_s(L.w_down_s);
+        count_s(L.wq_s);      count_s(L.wk_s);      count_s(L.wv_s);
+        count_s(L.wo_s);      count_s(L.wqkv_s);    count_s(L.wqkv_gate_s);
+        count_s(L.ssm_beta_s); count_s(L.ssm_alpha_s); count_s(L.ssm_out_s);
+        count_s(L.ffn_gate_inp_s); count_s(L.ffn_gate_exps_s);
+        count_s(L.ffn_up_exps_s); count_s(L.ffn_down_exps_s);
+        count_s(L.ffn_gate_up_exps_s); count_s(L.ffn_gate_inp_shexp_s);
+        count_s(L.ffn_gate_shexp_s); count_s(L.ffn_up_shexp_s);
+        count_s(L.ffn_down_shexp_s);
+    }
+
+    return n_scales;
+}
+
+bool verify_target_derived_scalars(const TargetWeights & out, std::string & err) {
+    // Structural defense: derive head_dim / n_head / n_head_kv from weight
+    // tensor shapes and assert against GGUF-declared metadata.
+    // Uses the first full-attention layer; deltanet layers don't carry wq/wk.
+    // wq packs Q+gate: ne[1] = n_head * n_embd_head_k * 2.
+    // wk: ne[1] = n_head_kv * n_embd_head_k.  wq: ne[0] = n_embd.
+    const int fa_il = out.full_attention_interval - 1;
+    if (fa_il < 0 || fa_il >= out.n_layer) {
+        return true;
+    }
+    const TargetLayer & fa = out.layers[(size_t)fa_il];
+    if (!fa.wq || !fa.wk) {
+        return true;
+    }
+    const int64_t exp_q_dim  = (int64_t)out.n_head    * out.n_embd_head_k * 2;
+    const int64_t exp_kv_dim = (int64_t)out.n_head_kv * out.n_embd_head_k;
+    const int64_t exp_n_embd = (int64_t)out.n_embd;
+    char tag[16];
+    std::snprintf(tag, sizeof(tag), "blk.%d", fa_il);
+    return dflash::common::verify_derived_scalars(
+        fa.wq->ne[1], fa.wk->ne[1], fa.wq->ne[0],
+        exp_q_dim, exp_kv_dim, exp_n_embd,
+        tag, err);
+}
 } // namespace
 
 bool load_target_gguf(const std::string & path,
@@ -538,27 +627,86 @@ bool load_target_gguf_partial(const std::string & path,
         alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
     }
-    if (allocs.empty()) {
+    auto release_out_buffer = [&]() {
+        if (out.buf) {
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+        }
+    };
+    if (plan.metadata_only) {
+        out.buf = nullptr;
+    } else if (allocs.empty()) {
         set_last_error("target load plan selected no GPU tensors");
         gguf_free(gctx);
         return false;
-    }
-
-    out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
-    if (!out.buf) {
-        set_last_error("ggml_backend_alloc_ctx_tensors failed (target)");
-        gguf_free(gctx);
-        return false;
-    }
-    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    char * base = (char *)ggml_backend_buffer_get_base(out.buf);
-    for (const TargetTensorAlloc & a : allocs) {
-        if (ggml_backend_tensor_alloc(out.buf, a.tensor, base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
-            set_last_error("ggml_backend_tensor_alloc failed (target)");
+    } else {
+        out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
+        if (!out.buf) {
+            set_last_error("ggml_backend_alloc_ctx_tensors failed (target)");
             gguf_free(gctx);
             return false;
         }
+        ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        char * base = (char *)ggml_backend_buffer_get_base(out.buf);
+        for (const TargetTensorAlloc & a : allocs) {
+            if (ggml_backend_tensor_alloc(out.buf, a.tensor, base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+                set_last_error("ggml_backend_tensor_alloc failed (target)");
+                release_out_buffer();
+                gguf_free(gctx);
+                return false;
+            }
+        }
+    }
+
+    const size_t data_start = gguf_get_data_offset(gctx);
+
+    if (plan.metadata_only) {
+#if !defined(_WIN32)
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0 || st.st_size < 0) {
+            set_last_error(std::string("stat failed for metadata-only target load: ") + std::strerror(errno));
+            gguf_free(gctx);
+            return false;
+        }
+        const size_t file_len = (size_t)st.st_size;
+#endif
+        for (int64_t tid = 0; tid < n_tensors; tid++) {
+            const char * tname = gguf_get_tensor_name(gctx, tid);
+            ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+            if (!t) continue;
+            const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+            const size_t sz  = gguf_get_tensor_size(gctx, tid);
+            if (off < data_start || off + sz < off
+#if !defined(_WIN32)
+                || off + sz > file_len
+#endif
+            ) {
+                set_last_error(std::string("tensor '") + tname + "' has invalid file range");
+                gguf_free(gctx);
+                return false;
+            }
+        }
+        GgufMmap mm;
+        if (!mm.open(path, err)) {
+            set_last_error(err);
+            gguf_free(gctx);
+            return false;
+        }
+        const int n_scales = read_target_layer_scales(
+            gctx, static_cast<const uint8_t *>(mm.data()), mm.size(), data_start, out);
+        if (n_scales > 0) {
+            std::printf("[loader] read %d NVFP4 per-tensor scale2 values (metadata-only)\n", n_scales);
+        }
+        if (!verify_target_derived_scalars(out, err)) {
+            set_last_error(err);
+            gguf_free(gctx);
+            return false;
+        }
+        gguf_free(gctx);
+        std::printf("[loader] target metadata-only load: layers=[%d,%d) output=%d tensors=%zu\n",
+                    plan.layer_begin, plan.layer_end, (int)plan.load_output, allocs.size());
+        return true;
     }
 
     // ── 4. mmap the file and copy tensor bytes to CUDA ────────────────
@@ -568,10 +716,14 @@ bool load_target_gguf_partial(const std::string & path,
     // into owned host memory below (step 5), so the mmap is released when this
     // local goes out of scope.
     GgufMmap mm;
-    if (!mm.open(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    if (!mm.open(path, err)) {
+        set_last_error(err);
+        release_out_buffer();
+        gguf_free(gctx);
+        return false;
+    }
     const uint8_t * mm_addr = (const uint8_t *)mm.data();
     const size_t    mm_len  = mm.size();
-    const size_t data_start = gguf_get_data_offset(gctx);
 
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
@@ -587,6 +739,7 @@ bool load_target_gguf_partial(const std::string & path,
             set_last_error(gguf_bounds_error("target GGUF", tname,
                 ggml_type_name(gguf_get_tensor_type(gctx, tid)),
                 data_start, rel_off, sz, mm_len));
+            release_out_buffer();
             gguf_free(gctx);
             return false;
         }
@@ -616,59 +769,8 @@ bool load_target_gguf_partial(const std::string & path,
     // LibertAI convention: "blk.N.ffn_gate.scale"
     // Heretic convention: "blk.N.ffn_gate.weight.scale"
     {
-        auto read_scale = [&](int il, const char * base) -> float {
-            char sname[128];
-            // Try "base.scale" first (LibertAI), then "base.weight.scale" (heretic)
-            std::snprintf(sname, sizeof(sname), "blk.%d.%s.scale", il, base);
-            int64_t stid = gguf_find_tensor(gctx, sname);
-            if (stid < 0) {
-                std::snprintf(sname, sizeof(sname), "blk.%d.%s.weight.scale", il, base);
-                stid = gguf_find_tensor(gctx, sname);
-            }
-            if (stid < 0) return 1.0f;
-            const size_t srel = gguf_get_tensor_offset(gctx, stid);
-            if (!gguf_tensor_in_file(data_start, srel, sizeof(float), mm_len)) return 1.0f;
-            float val;
-            std::memcpy(&val, mm_addr + data_start + srel, sizeof(float));
-            return val;
-        };
-
-        int n_scales = 0;
-        for (int il = 0; il < (int)n_layer; il++) {
-            TargetLayer & L = out.layers[il];
-            L.w_gate_s     = read_scale(il, "ffn_gate");
-            L.w_up_s       = read_scale(il, "ffn_up");
-            L.w_down_s     = read_scale(il, "ffn_down");
-            L.wq_s         = read_scale(il, "attn_q");
-            L.wk_s         = read_scale(il, "attn_k");
-            L.wv_s         = read_scale(il, "attn_v");
-            L.wo_s         = read_scale(il, "attn_output");
-            L.wqkv_s       = read_scale(il, "attn_qkv");
-            L.wqkv_gate_s  = read_scale(il, "attn_gate");
-            L.ssm_beta_s   = read_scale(il, "ssm_beta");
-            L.ssm_alpha_s  = read_scale(il, "ssm_alpha");
-            L.ssm_out_s    = read_scale(il, "ssm_out");
-            L.ffn_gate_inp_s       = read_scale(il, "ffn_gate_inp");
-            L.ffn_gate_exps_s      = read_scale(il, "ffn_gate_exps");
-            L.ffn_up_exps_s        = read_scale(il, "ffn_up_exps");
-            L.ffn_down_exps_s      = read_scale(il, "ffn_down_exps");
-            L.ffn_gate_up_exps_s   = read_scale(il, "ffn_gate_up_exps");
-            L.ffn_gate_inp_shexp_s = read_scale(il, "ffn_gate_inp_shexp");
-            L.ffn_gate_shexp_s     = read_scale(il, "ffn_gate_shexp");
-            L.ffn_up_shexp_s       = read_scale(il, "ffn_up_shexp");
-            L.ffn_down_shexp_s     = read_scale(il, "ffn_down_shexp");
-            // Count non-trivial scales for the summary message.
-            auto count_s = [&](float s) { if (s != 1.0f) n_scales++; };
-            count_s(L.w_gate_s);   count_s(L.w_up_s);   count_s(L.w_down_s);
-            count_s(L.wq_s);      count_s(L.wk_s);      count_s(L.wv_s);
-            count_s(L.wo_s);      count_s(L.wqkv_s);    count_s(L.wqkv_gate_s);
-            count_s(L.ssm_beta_s); count_s(L.ssm_alpha_s); count_s(L.ssm_out_s);
-            count_s(L.ffn_gate_inp_s); count_s(L.ffn_gate_exps_s);
-            count_s(L.ffn_up_exps_s); count_s(L.ffn_down_exps_s);
-            count_s(L.ffn_gate_up_exps_s); count_s(L.ffn_gate_inp_shexp_s);
-            count_s(L.ffn_gate_shexp_s); count_s(L.ffn_up_shexp_s);
-            count_s(L.ffn_down_shexp_s);
-        }
+        const int n_scales = read_target_layer_scales(
+            gctx, mm_addr, mm_len, data_start, out);
         if (n_scales > 0) {
             std::printf("[loader] read %d NVFP4 per-tensor scale2 values (host-side, using ggml_scale)\n", n_scales);
         }
@@ -676,33 +778,15 @@ bool load_target_gguf_partial(const std::string & path,
 
     gguf_free(gctx);
 
-    // Structural defense: derive head_dim / n_head / n_head_kv from weight
-    // tensor shapes and assert against GGUF-declared metadata.
-    // Uses the first full-attention layer; deltanet layers don't carry wq/wk.
-    // wq packs Q+gate: ne[1] = n_head * n_embd_head_k * 2.
-    // wk: ne[1] = n_head_kv * n_embd_head_k.  wq: ne[0] = n_embd.
-    {
-        const int fa_il = out.full_attention_interval - 1;
-        const TargetLayer & fa = out.layers[(size_t)fa_il];
-        if (fa.wq && fa.wk) {
-            const int64_t exp_q_dim  = (int64_t)out.n_head    * out.n_embd_head_k * 2;
-            const int64_t exp_kv_dim = (int64_t)out.n_head_kv * out.n_embd_head_k;
-            const int64_t exp_n_embd = (int64_t)out.n_embd;
-            char tag[16];
-            std::snprintf(tag, sizeof(tag), "blk.%d", fa_il);
-            std::string err;
-            if (!dflash::common::verify_derived_scalars(
-                    fa.wq->ne[1], fa.wk->ne[1], fa.wq->ne[0],
-                    exp_q_dim, exp_kv_dim, exp_n_embd,
-                    tag, err)) {
-                set_last_error(err);
-                return false;
-            }
-        }
+    if (!verify_target_derived_scalars(out, err)) {
+        set_last_error(err);
+        release_out_buffer();
+        return false;
     }
 
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
+        release_out_buffer();
         return false;
     }
 
@@ -710,6 +794,7 @@ bool load_target_gguf_partial(const std::string & path,
     //       entire GGUF mmap resident just for CPU embedding lookup.
     if (out.n_vocab <= 0) {
         set_last_error("invalid n_vocab in GGUF metadata (token embedder cannot be sized)");
+        release_out_buffer();
         return false;
     }
     out.embedder.tok_embd_owned.resize(tok_embd_sz);
