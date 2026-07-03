@@ -520,6 +520,7 @@ class PrefixCache:
         self.disabled = False
 
         self.entries: OrderedDict[bytes, int] = OrderedDict()  # hash → slot_id
+        self._slot_prefix_len: dict[int, int] = {}  # slot → committed cut depth
         self.next_slot = 0
         try:
             self.markers = _resolve_chat_markers(tokenizer)
@@ -571,10 +572,21 @@ class PrefixCache:
         best: tuple[int, int] | None = None   # (slot_id, prefix_len)
         for cut in candidates:
             key = hash_prefix(prompt_ids[:cut], self.kv_k_type, self.fa_window)
-            if key in self.entries:
-                if best is None or cut > best[1]:
-                    best = (self.entries[key], cut)
-                self.entries.move_to_end(key)   # mark fresh
+            if key not in self.entries:
+                continue
+            slot = self.entries[key]
+            committed = self._slot_prefix_len.get(slot)
+            if committed is not None and committed != cut:
+                # Slot was refreshed in-place at a deeper boundary; an older
+                # shallow hash→slot mapping would restore the wrong cur_pos.
+                print(f"{self.log_prefix} lookup stale slot={slot} "
+                      f"key_cut={cut} committed={committed} — evicting",
+                      flush=True)
+                del self.entries[key]
+                continue
+            if best is None or cut > best[1]:
+                best = (slot, cut)
+            self.entries.move_to_end(key)   # mark fresh
         if best is not None and best[0] not in self._populated_slots:
             print(f"{self.log_prefix} lookup skip slot={best[0]} "
                   f"(not populated in daemon)", flush=True)
@@ -684,7 +696,13 @@ class PrefixCache:
             self._pending_evict_key = None
         key = hash_prefix(prompt_ids[:target_cut],
                           self.kv_k_type, self.fa_window)
+        # In-place slot refresh leaves stale shallow hash→slot entries; drop them.
+        stale_keys = [k for k, s in self.entries.items()
+                      if s == slot and k != key]
+        for k in stale_keys:
+            del self.entries[k]
         self.entries[key] = slot
+        self._slot_prefix_len[slot] = target_cut
         self._populated_slots.add(slot)
         print(f"{self.log_prefix} inline-snap committed slot={slot} "
               f"prefix_len={target_cut}", flush=True)
@@ -951,6 +969,7 @@ class PrefixCache:
         if self.disabled:
             return
         self._populated_slots.clear()
+        self._slot_prefix_len.clear()
         async with self.lock:
             self._send("LIST_SLOTS\n")
             reply = await self._await_reply("[snap] slots=", timeout=timeout)
