@@ -55,6 +55,7 @@ Option 3 — full-compress-result cache:
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import struct
 from collections import OrderedDict
@@ -78,10 +79,45 @@ class DaemonStdoutBus:
         "[prefill]", "[migrate]", "[dbg ", "  ",
     )
 
+    _PREFILL_TIMING_RE = re.compile(
+        r"\[prefill\](?: layer-seg)? (\d+) tokens in ([\d.]+) s"
+    )
+    _DFLASH_TIMING_RE = re.compile(
+        r"\[dflash\] generated (\d+) tokens in ([\d.]+) s\s+->\s+([\d.]+) tok/s"
+    )
+
     def __init__(self, stdout):
         self.stdout = stdout
         self._waiters: list[tuple[str, asyncio.Future]] = []
         self._task: asyncio.Task | None = None
+        self._request_inline_slot: int | None = None
+        self._timings: dict[str, float | int] = {}
+
+    def begin_request(self) -> None:
+        """Reset per-request daemon telemetry (inline snap ack, timings, etc.)."""
+        self._request_inline_slot = None
+        self._timings = {}
+
+    def inline_snap_slot(self) -> int | None:
+        """Slot id if daemon emitted ``[snap] inline slot=N`` this request."""
+        return self._request_inline_slot
+
+    def request_timings(self) -> dict[str, float | int]:
+        """Daemon-reported prefill/decode timings for the active request."""
+        return dict(self._timings)
+
+    def _parse_timing_line(self, decoded: str) -> None:
+        m = self._PREFILL_TIMING_RE.search(decoded)
+        if m:
+            self._timings["prefill_tokens"] = int(m.group(1))
+            self._timings["prefill_ms"] = round(float(m.group(2)) * 1000.0, 2)
+            return
+        m = self._DFLASH_TIMING_RE.search(decoded)
+        if m:
+            self._timings["completion_tokens"] = int(m.group(1))
+            gen_s = float(m.group(2))
+            self._timings["decode_ms"] = round(gen_s * 1000.0, 2)
+            self._timings["decode_tokens_per_sec"] = round(float(m.group(3)), 2)
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._task = loop.create_task(self._run())
@@ -99,6 +135,15 @@ class DaemonStdoutBus:
                 return
             decoded = line.decode("utf-8", errors="replace").rstrip()
 
+            self._parse_timing_line(decoded)
+
+            if decoded.startswith("[snap] inline slot="):
+                try:
+                    slot_s = decoded.split("slot=", 1)[1].split()[0]
+                    self._request_inline_slot = int(slot_s)
+                except (IndexError, ValueError):
+                    pass
+
             # Try to satisfy a waiter first.
             matched = False
             for i, (prefix, fut) in enumerate(self._waiters):
@@ -112,6 +157,30 @@ class DaemonStdoutBus:
                 # Log line — suppress very noisy prefixes.
                 if decoded and not any(decoded.startswith(p) for p in self._SUPPRESS_PREFIXES):
                     print(f"  [daemon] {decoded}", flush=True)
+
+    async def drain_timings(self, timeout: float = 3.0) -> None:
+        """Wait until daemon emits prefill + decode timing lines (or timeout)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            has_prefill = self._timings.get("prefill_ms") is not None
+            has_decode = (
+                self._timings.get("decode_ms") is not None
+                or self._timings.get("decode_tokens_per_sec") is not None
+            )
+            if has_prefill and has_decode:
+                return
+            await asyncio.sleep(0.005)
+
+    async def drain_inline_snap(self, timeout: float = 10.0) -> int | None:
+        """Wait until the read loop consumes ``[snap] inline slot=N`` (or timeout)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if self._request_inline_slot is not None:
+                return self._request_inline_slot
+            await asyncio.sleep(0.005)
+        return self._request_inline_slot
 
     async def await_reply(self, prefix: str, timeout: float = 10.0) -> str:
         """Block until daemon emits a line starting with *prefix*."""
@@ -469,6 +538,8 @@ class PrefixCache:
         # that if the request aborts before confirm runs, the old entry survives
         # and the daemon slot count stays consistent.
         self._pending_evict_key: bytes | None = None
+        # Slots known to hold KV in the daemon (inline snap ack or full snap).
+        self._populated_slots: set[int] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -504,12 +575,43 @@ class PrefixCache:
                 if best is None or cut > best[1]:
                     best = (self.entries[key], cut)
                 self.entries.move_to_end(key)   # mark fresh
+        if best is not None and best[0] not in self._populated_slots:
+            print(f"{self.log_prefix} lookup skip slot={best[0]} "
+                  f"(not populated in daemon)", flush=True)
+            best = None
         if best is not None:
             print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
                   f"(of {len(prompt_ids)} total)", flush=True)
         return best
 
-    def prepare_inline_snap(self, prompt_ids: list[int]) -> tuple[int, int] | None:
+    def slot_populated(self, slot: int) -> bool:
+        return slot in self._populated_slots
+
+    def mark_slot_populated(self, slot: int) -> None:
+        self._populated_slots.add(slot)
+
+    def finish_inline_snap(
+        self,
+        snap_prep: tuple[int, int] | None,
+        prompt_ids: list[int],
+        *,
+        inline_slot: int | None,
+    ) -> None:
+        """Confirm or abort an inline snap reservation based on daemon ack."""
+        if not snap_prep:
+            return
+        slot, target_cut = snap_prep
+        if inline_slot == slot:
+            self.confirm_inline_snap(slot, target_cut, prompt_ids)
+        else:
+            self.abort_inline_snap(slot)
+
+    def prepare_inline_snap(
+        self,
+        prompt_ids: list[int],
+        *,
+        reuse_slot: int | None = None,
+    ) -> tuple[int, int] | None:
         """Pick a target boundary + slot for inline snapshot during the next
         request. Returns ``(slot_id, target_cut)`` or ``None`` if no
         snapshot is needed (e.g. boundary already cached).
@@ -544,7 +646,10 @@ class PrefixCache:
         # The actual eviction is deferred to confirm_inline_snap so that if the
         # request aborts before confirm runs, the old entry survives and the
         # daemon slot count stays consistent.
-        if len(self.entries) >= self.cap:
+        if reuse_slot is not None and reuse_slot in self._populated_slots:
+            slot = reuse_slot
+            self._pending_evict_key = None
+        elif len(self.entries) >= self.cap:
             # Peek at LRU without removing.
             old_key = next(iter(self.entries))
             slot = self.entries[old_key]
@@ -575,6 +680,7 @@ class PrefixCache:
         key = hash_prefix(prompt_ids[:target_cut],
                           self.kv_k_type, self.fa_window)
         self.entries[key] = slot
+        self._populated_slots.add(slot)
         print(f"{self.log_prefix} inline-snap committed slot={slot} "
               f"prefix_len={target_cut}", flush=True)
 
@@ -839,6 +945,7 @@ class PrefixCache:
         """
         if self.disabled:
             return
+        self._populated_slots.clear()
         async with self.lock:
             self._send("LIST_SLOTS\n")
             reply = await self._await_reply("[snap] slots=", timeout=timeout)

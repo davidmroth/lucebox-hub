@@ -28,6 +28,7 @@ Run:
   python3 scripts/server_tools.py --port 8000
 """
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -52,6 +53,12 @@ from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
 
 from prefix_cache import DaemonStdoutBus, PrefixCache
+from tool_split.config import ToolSplitConfig, add_cli_flags as add_tool_split_flags
+from tool_split.config import config_from_env_and_args as tool_split_config_from_args
+from tool_split.base import ToolRequestContext
+from tool_split.daemon_bridge import commit_pending_tool_snap
+from tool_split.orchestrator import ToolSplitOrchestrator
+from tool_split.registry import resolve_adapter as resolve_tool_split_adapter
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -400,7 +407,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
               prefix_cache_slots: int = 4,
               prefill_cache_slots: int = 4,
               arch: str = "qwen35",
-              extra_daemon_args: list[str] | None = None) -> FastAPI:
+              extra_daemon_args: list[str] | None = None,
+              tool_split_cfg: ToolSplitConfig | None = None,
+              tool_split: ToolSplitOrchestrator | None = None) -> FastAPI:
     import asyncio
     if _extra_daemon_has_target_sharding(extra_daemon_args):
         if prefix_cache_slots > 0 or prefill_cache_slots > 0:
@@ -411,6 +420,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
             prefix_cache_slots = 0
             prefill_cache_slots = 0
+        if tool_split is not None:
+            print(
+                "  [cfg] target-gpus sharding: disabling tool-split "
+                "(SNAPSHOT_THIN / RESTORE_CHAIN unsupported)",
+                flush=True,
+            )
+            tool_split = None
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = asyncio.Lock()
 
@@ -480,11 +496,122 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     if prefill_cfg is not None and prefill_cache_slots > 0:
         prefix_cache.init_full_cache(prefill_cache_slots)
 
+    async def _finish_inline_snap(
+        snap_prep: tuple[int, int] | None,
+        prompt_ids: list[int],
+    ) -> None:
+        if snap_prep:
+            await bus.drain_inline_snap()
+            prefix_cache.finish_inline_snap(
+                snap_prep, prompt_ids, inline_slot=bus.inline_snap_slot())
+
+    def _build_usage(
+        prompt_len: int,
+        completion_tokens: int,
+        *,
+        conv_prefix_len: int | None = None,
+    ) -> dict:
+        usage = {
+            "prompt_tokens": prompt_len,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_len + completion_tokens,
+        }
+        timings: dict[str, float | int] = {}
+        raw = bus.request_timings()
+        for key in ("prefill_ms", "decode_ms", "decode_tokens_per_sec"):
+            val = raw.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                timings[key] = val
+        if conv_prefix_len is not None and conv_prefix_len > 0:
+            timings["prefix_len"] = conv_prefix_len
+        if timings:
+            usage["timings"] = timings
+        return usage
+
+    def _compose_daemon_cmd(
+        cur_bin: Path,
+        gen_len: int,
+        prompt_ids: list[int],
+        *,
+        full_hit,
+        compression_fired: bool,
+        full_snap_prep,
+        cur_ids: list[int] | None,
+        tool_ctx: ToolRequestContext | None,
+    ) -> tuple[str, object | None, int | None]:
+        """Build daemon stdin line, optional inline snap_prep, conv prefix len."""
+        if full_hit is not None:
+            slot, cached_cur_bin, cached_len = full_hit
+            return f"RESTORE {slot} {cached_cur_bin} {gen_len}\n", None, cached_len
+        if compression_fired:
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n", None, None
+            return f"{cur_bin} {gen_len}\n", None, None
+
+        hit = prefix_cache.lookup(prompt_ids)
+        conv_prefix_len = hit[1] if hit else None
+        reuse = hit[0] if hit else None
+        snap_prep = prefix_cache.prepare_inline_snap(prompt_ids, reuse_slot=reuse)
+
+        if tool_split and tool_ctx and tool_ctx.tool_slot_hit is not None:
+            plan = tool_split.build_plan(
+                split=tool_ctx.split,
+                tools_fingerprint=tool_ctx.fingerprint,
+                prompt_bin=cur_bin,
+                prompt_len=len(prompt_ids),
+                tool_slot_hit=tool_ctx.tool_slot_hit,
+                conv_hit=hit,
+                snap_prep=snap_prep,
+                pending_tool_snap=tool_ctx.pending_tool_snap,
+            )
+            cmd = tool_split.format_daemon_command(plan, gen_len)
+            print(
+                f"  [tool-split] RESTORE_CHAIN thick={plan.conv_restore_slot} "
+                f"thin={plan.thin_slot_ids} prompt_tokens={len(prompt_ids)}",
+                flush=True,
+            )
+            return cmd, snap_prep, conv_prefix_len
+
+        if hit:
+            slot, _prefix_len = hit
+            cmd = f"RESTORE {slot} {cur_bin} {gen_len}"
+        else:
+            cmd = f"{cur_bin} {gen_len}"
+        if snap_prep:
+            cmd += f" snap={snap_prep[1]}:{snap_prep[0]}"
+        return cmd + "\n", snap_prep, conv_prefix_len
+
+    async def _commit_tool_snap_if_needed(tool_ctx: ToolRequestContext | None) -> None:
+        if not tool_split or not tool_ctx or not tool_ctx.pending_tool_snap:
+            return
+        if not tool_ctx.fingerprint:
+            return
+        slot, kv_end = tool_ctx.pending_tool_snap
+        await commit_pending_tool_snap(
+            orchestrator=tool_split,
+            daemon_stdin=daemon_proc.stdin,
+            await_reply=bus.await_reply,
+            fingerprint=tool_ctx.fingerprint,
+            slot=slot,
+            kv_end=kv_end,
+        )
+
     @app.on_event("startup")
     async def _startup():
         import asyncio
         bus.start(asyncio.get_running_loop())
         await prefix_cache.startup_sync()
+
+    @app.get("/health")
+    def health():
+        alive = daemon_proc.poll() is None
+        if not alive:
+            return JSONResponse(
+                {"status": "error", "detail": "daemon exited"},
+                status_code=503,
+            )
+        return {"status": "ok"}
 
     @app.get("/v1/models")
     def list_models():
@@ -497,13 +624,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         """If prefill is on and the request has no tools and the last user
         message is long, run the daemon compress + re-tokenise. Returns
         (bin, prompt_len, started_in_thinking) — the last is recomputed when
-        compression fires, otherwise passed through."""
+        compression fires, otherwise passed through.
+
+        When ``tool_split`` is active and ``req.tools`` is non-empty, tool
+        definitions stay in the template while only conversation text is
+        eligible for PFlash (same last-user-message compress path).
+        """
         if not prefill_cfg or not prefill_cfg.enabled:
             return prompt_bin, prompt_len, started_in_thinking
-        if req.tools:
-            # Tool definitions ride in the prompt; compressing them mangles JSON.
+        tools_present = bool(req.tools)
+        if tools_present and not tool_split:
+            # Legacy: monolithic prompt — compressing mangles tool JSON in-stream.
             return prompt_bin, prompt_len, started_in_thinking
-        if not prefill_cfg.should_compress(prompt_len) or drafter_tokenizer is None:
+
+        compress_len = prompt_len
+        if tools_present and tool_split:
+            try:
+                split = tool_split.split_request(
+                    tokenizer, req.messages, req.tools,
+                    chat_template_kwargs=req.chat_template_kwargs,
+                )
+                if tool_split.conversation_compressible(split):
+                    compress_len = split.conversation_len
+            except Exception as exc:
+                print(f"  [tool-split] split failed, skipping conv compress: {exc}",
+                      flush=True)
+
+        if not prefill_cfg.should_compress(compress_len) or drafter_tokenizer is None:
             return prompt_bin, prompt_len, started_in_thinking
 
         last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
@@ -540,6 +687,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             {k: v for k, v in (req.chat_template_kwargs or {}).items()
              if k in _ALLOWED_TEMPLATE_KWARGS},
         )
+        if req.tools:
+            kwargs["tools"] = [t.model_dump() for t in req.tools]
+            kwargs["enable_thinking"] = False
         prompt = tokenizer.apply_chat_template(new_msgs, **kwargs)
         new_started_in_thinking = bool(re.search(r"<think>\s*$", prompt))
         ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -672,7 +822,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         compression_fired = False
 
         async with daemon_lock:
-            if prefill_cfg is not None and prefill_cfg.enabled and not req.tools:
+            allow_full_cache = (
+                prefill_cfg is not None
+                and prefill_cfg.enabled
+                and (not req.tools or tool_split is not None)
+            )
+            if allow_full_cache:
                 full_hit = prefix_cache.lookup_full(prompt_ids)
 
             if full_hit is not None:
@@ -713,6 +868,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
                 status_code=400)
 
+        tool_ctx: ToolRequestContext | None = None
+        if tool_split and req.tools:
+            try:
+                tool_ctx = tool_split.prepare_request_context(
+                    tokenizer, req.messages, req.tools,
+                    chat_template_kwargs=req.chat_template_kwargs,
+                )
+            except Exception as exc:
+                print(f"  [tool-split] prepare_request_context failed: {exc}", flush=True)
+
         if req.stream:
             return await _stream_response(req, cur_bin, prompt_ids, gen_len,
                                            completion_id, created,
@@ -720,39 +885,30 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                            full_hit=full_hit,
                                            full_snap_prep=full_snap_prep,
                                            compression_fired=compression_fired,
-                                           cur_ids=cur_ids)
+                                           cur_ids=cur_ids,
+                                           tool_ctx=tool_ctx)
 
         # Non-streaming: collect, parse, return.
         async with daemon_lock:
-            if full_hit is not None:
-                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
-                snap_prep = None
-            elif compression_fired:
-                if full_snap_prep is not None:
-                    fslot, _ = full_snap_prep
-                    cmd_line = f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n"
-                else:
-                    cmd_line = f"{cur_bin} {gen_len}\n"
-                snap_prep = None
-            else:
-                hit = prefix_cache.lookup(prompt_ids)
-                snap_prep = prefix_cache.prepare_inline_snap(prompt_ids)
-                if hit:
-                    slot, _prefix_len = hit
-                    cmd_line = f"RESTORE {slot} {cur_bin} {gen_len}"
-                else:
-                    cmd_line = f"{cur_bin} {gen_len}"
-                if snap_prep:
-                    cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
-                cmd_line += "\n"
+            cmd_line, snap_prep, conv_prefix_len = _compose_daemon_cmd(
+                cur_bin, gen_len, prompt_ids,
+                full_hit=full_hit,
+                compression_fired=compression_fired,
+                full_snap_prep=full_snap_prep,
+                cur_ids=cur_ids,
+                tool_ctx=tool_ctx,
+            )
+            bus.begin_request()
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
-            tokens = list(_token_stream(r_pipe, gen_len))
+            tokens = await asyncio.to_thread(list, _token_stream(r_pipe, gen_len))
+            await bus.drain_timings()
             if full_snap_prep is not None:
                 fslot, _ = full_snap_prep
                 prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-            elif snap_prep:
-                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+            else:
+                await _finish_inline_snap(snap_prep, prompt_ids)
+            await _commit_tool_snap_if_needed(tool_ctx)
         if full_hit is None:
             try: cur_bin.unlink()
             except Exception: pass
@@ -799,15 +955,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 "message": msg,
                 "finish_reason": finish_reason,
             }],
-            "usage": {"prompt_tokens": prompt_len,
-                      "completion_tokens": len(tokens),
-                      "total_tokens": prompt_len + len(tokens)},
+            "usage": _build_usage(
+                prompt_len, len(tokens), conv_prefix_len=conv_prefix_len),
         })
 
     async def _stream_response(req, prompt_bin, prompt_ids, gen_len, completion_id,
                                 created, started_in_thinking, lock,
                                 full_hit=None, full_snap_prep=None,
-                                compression_fired=False, cur_ids=None):
+                                compression_fired=False, cur_ids=None,
+                                tool_ctx: ToolRequestContext | None = None):
         # prompt_bin may be cur_bin (the compressed bin) when coming from the
         # compression or full-cache-hit path; prompt_len is derived from it.
         prompt_len = prompt_bin.stat().st_size // 4 if full_hit is None else (
@@ -822,30 +978,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         async def sse() -> AsyncIterator[str]:
             async with lock:
-                if full_hit is not None:
-                    # Full-cache hit: RESTORE with cached cur_bin.
-                    slot, cached_cur_bin, _cached_len = full_hit
-                    cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
-                    snap_prep = None
-                elif compression_fired:
-                    # Compression fired on this request; set up full-cache snap.
-                    if full_snap_prep is not None:
-                        fslot, _ = full_snap_prep
-                        cmd_line = f"{prompt_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n"
-                    else:
-                        cmd_line = f"{prompt_bin} {gen_len}\n"
-                    snap_prep = None
-                else:
-                    hit = prefix_cache.lookup(prompt_ids)
-                    snap_prep = prefix_cache.prepare_inline_snap(prompt_ids)
-                    if hit:
-                        slot, _prefix_len = hit
-                        cmd_line = f"RESTORE {slot} {prompt_bin} {gen_len}"
-                    else:
-                        cmd_line = f"{prompt_bin} {gen_len}"
-                    if snap_prep:
-                        cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
-                    cmd_line += "\n"
+                cmd_line, snap_prep, conv_prefix_len = _compose_daemon_cmd(
+                    prompt_bin, gen_len, prompt_ids,
+                    full_hit=full_hit,
+                    compression_fired=compression_fired,
+                    full_snap_prep=full_snap_prep,
+                    cur_ids=cur_ids,
+                    tool_ctx=tool_ctx,
+                )
+                bus.begin_request()
                 daemon_proc.stdin.write(cmd_line.encode("utf-8"))
                 daemon_proc.stdin.flush()
 
@@ -946,11 +1087,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         if include_usage:
                             usage_chunk = {"id": completion_id, "object": "chat.completion.chunk",
                                            "created": created, "model": MODEL_NAME, "choices": [],
-                                           "usage": {"prompt_tokens": prompt_len,
-                                                      "completion_tokens": completion_tokens,
-                                                      "total_tokens": prompt_len + completion_tokens}}
+                                           "usage": _build_usage(
+                                               prompt_len, completion_tokens,
+                                               conv_prefix_len=conv_prefix_len)}
                             yield f"data: {json.dumps(usage_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
+                        await bus.drain_timings()
+                        if full_snap_prep is not None:
+                            fslot, _ = full_snap_prep
+                            prefix_cache.confirm_full_snap(
+                                fslot, prompt_ids, prompt_bin, len(cur_ids))
+                        else:
+                            await _finish_inline_snap(snap_prep, prompt_ids)
+                        await _commit_tool_snap_if_needed(tool_ctx)
                         if full_hit is None:
                             try: prompt_bin.unlink()
                             except Exception: pass
@@ -990,11 +1139,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         try: prompt_bin.unlink()
                         except Exception: pass
 
+                await bus.drain_timings()
                 if full_snap_prep is not None:
                     fslot, _ = full_snap_prep
                     prefix_cache.confirm_full_snap(fslot, prompt_ids, prompt_bin, len(cur_ids))
-                elif snap_prep:
-                    prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+                else:
+                    await _finish_inline_snap(snap_prep, prompt_ids)
+                await _commit_tool_snap_if_needed(tool_ctx)
 
                 yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                 if include_usage:
@@ -1002,9 +1153,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": MODEL_NAME,
                         "choices": [],
-                        "usage": {"prompt_tokens": prompt_len,
-                                   "completion_tokens": completion_tokens,
-                                   "total_tokens": prompt_len + completion_tokens},
+                        "usage": _build_usage(
+                            prompt_len, completion_tokens,
+                            conv_prefix_len=conv_prefix_len),
                     }
                     yield f"data: {json.dumps(usage_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -1199,6 +1350,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     }
                     yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
 
+                    bus.begin_request()
                     daemon_proc.stdin.write(cmd_line.encode("utf-8"))
                     daemon_proc.stdin.flush()
 
@@ -1227,8 +1379,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     if full_snap_prep is not None:
                         fslot, _ = full_snap_prep
                         prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-                    elif snap_prep:
-                        prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+                    else:
+                        await _finish_inline_snap(snap_prep, prompt_ids)
 
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
 
@@ -1266,14 +1418,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 if snap_prep:
                     cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
                 cmd_line += "\n"
+            bus.begin_request()
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
             tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
             if full_snap_prep is not None:
                 fslot, _ = full_snap_prep
                 prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-            elif snap_prep:
-                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+            else:
+                await _finish_inline_snap(snap_prep, prompt_ids)
 
         if full_hit is None:
             try: cur_bin.unlink()
@@ -1352,6 +1505,7 @@ def main():
                     help="No-op: accepted for parity with server.py / Compose; "
                          "this process always runs test_dflash with --daemon.")
     add_cli_flags(ap)
+    add_tool_split_flags(ap)
     ap.add_argument("--prefix-cache-slots", type=int, default=4,
                     help="Number of prefix-cache snapshot slots (0 to disable)")
     ap.add_argument("--prefill-cache-slots", type=int, default=4,
@@ -1360,6 +1514,32 @@ def main():
                          "prefix-cache-slots + prefill-cache-slots must not exceed 8.")
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
+
+    tool_split_cfg = tool_split_config_from_args(args)
+    if getattr(args, "tool_split", None) == "auto":
+        tool_split_cfg = ToolSplitConfig(
+            enabled=True,
+            profile=tool_split_cfg.profile,
+            plugin_dir=tool_split_cfg.plugin_dir,
+            pinned_tool_slots=tool_split_cfg.pinned_tool_slots,
+            compress_conversation=tool_split_cfg.compress_conversation,
+        )
+    elif getattr(args, "tool_split", None) == "on":
+        tool_split_cfg = ToolSplitConfig(
+            enabled=True,
+            profile=tool_split_cfg.profile or "auto",
+            plugin_dir=tool_split_cfg.plugin_dir,
+            pinned_tool_slots=tool_split_cfg.pinned_tool_slots,
+            compress_conversation=tool_split_cfg.compress_conversation,
+        )
+    elif getattr(args, "tool_split", None) == "off":
+        tool_split_cfg = ToolSplitConfig(
+            enabled=False,
+            profile=tool_split_cfg.profile,
+            plugin_dir=tool_split_cfg.plugin_dir,
+            pinned_tool_slots=tool_split_cfg.pinned_tool_slots,
+            compress_conversation=tool_split_cfg.compress_conversation,
+        )
 
     # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
     # setdefault so an explicit user DFLASH27B_KV_TQ3=0 still wins.
@@ -1419,6 +1599,53 @@ def main():
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
 
+    tool_split_orchestrator = None
+    if tool_split_cfg.enabled:
+        adapter = resolve_tool_split_adapter(
+            tool_split_cfg, arch=arch, tokenizer_id=tokenizer_id)
+        if adapter is not None:
+            if tool_split_cfg.pinned_tool_slots > 0:
+                total_slots = (
+                    args.prefix_cache_slots
+                    + args.prefill_cache_slots
+                    + tool_split_cfg.pinned_tool_slots
+                )
+                if total_slots > PrefixCache.DAEMON_MAX_SLOTS:
+                    overflow = total_slots - PrefixCache.DAEMON_MAX_SLOTS
+                    if args.prefill_cache_slots > 0:
+                        cut = min(overflow, args.prefill_cache_slots)
+                        args.prefill_cache_slots -= cut
+                        overflow -= cut
+                    if overflow > 0 and args.prefix_cache_slots > 0:
+                        cut = min(overflow, args.prefix_cache_slots)
+                        args.prefix_cache_slots -= cut
+                        overflow -= cut
+                    if overflow > 0:
+                        tool_split_cfg = ToolSplitConfig(
+                            enabled=tool_split_cfg.enabled,
+                            profile=tool_split_cfg.profile,
+                            plugin_dir=tool_split_cfg.plugin_dir,
+                            pinned_tool_slots=max(
+                                0,
+                                tool_split_cfg.pinned_tool_slots - overflow,
+                            ),
+                            compress_conversation=tool_split_cfg.compress_conversation,
+                        )
+                    print(
+                        f"  [cfg] tool-split slot budget: prefix={args.prefix_cache_slots} "
+                        f"prefill={args.prefill_cache_slots} "
+                        f"tool_pins={tool_split_cfg.pinned_tool_slots} "
+                        f"(daemon max {PrefixCache.DAEMON_MAX_SLOTS})",
+                        flush=True,
+                    )
+            from tool_split.orchestrator import ToolSlotCache
+            tool_split_orchestrator = ToolSplitOrchestrator(
+                adapter=adapter, config=tool_split_cfg)
+            tool_split_orchestrator.tool_slots = ToolSlotCache(
+                pinned_slots=tool_split_cfg.pinned_tool_slots,
+                slot_base=args.prefix_cache_slots + args.prefill_cache_slots,
+            )
+
     extra_daemon: list[str] = []
     if args.draft_feature_mirror:
         extra_daemon.append("--draft-feature-mirror")
@@ -1442,7 +1669,9 @@ def main():
                     prefix_cache_slots=args.prefix_cache_slots,
                     prefill_cache_slots=args.prefill_cache_slots,
                     arch=arch,
-                    extra_daemon_args=extra_daemon or None)
+                    extra_daemon_args=extra_daemon or None,
+                    tool_split_cfg=tool_split_cfg,
+                    tool_split=tool_split_orchestrator)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server (tool-aware) on http://{args.host}:{args.port}")
@@ -1458,6 +1687,16 @@ def main():
               f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
     else:
         print("  pflash = off")
+    if tool_split_orchestrator is not None:
+        print(f"  tool-split = on · profile={tool_split_orchestrator.profile} "
+              f"pinned_slots={tool_split_cfg.pinned_tool_slots} "
+              f"compress_conv={tool_split_cfg.compress_conversation}")
+        if tool_split_cfg.plugin_dir:
+            print(f"  tool-split plugins = {tool_split_cfg.plugin_dir}")
+    elif tool_split_cfg.enabled:
+        print("  tool-split = requested but no adapter matched (disabled)")
+    else:
+        print("  tool-split = off")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
