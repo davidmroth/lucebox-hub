@@ -1,28 +1,34 @@
-# Tool-split on ai.local — project goal
+# Tool-split — project goal
 
-## North star
+## The idea
 
-**Practical, usable speedup** — an agent using tools on `ai.local` should feel meaningfully faster after the first turn, not just score well on internal prefill metrics.
+Agents that use tools (read a file, run a command, search code) should feel **fast after the first turn** — not like every message is starting from scratch.
 
-What the user experiences:
+Today, tool definitions get mixed into the same prompt as the conversation. That hurts **PFlash**, the system that compresses and speeds up long chat history. When tools and chat share one blob of text, PFlash has to fight through tool JSON it was never meant to optimize. You pay for the tools again and again, and the conversation speedups never fully kick in.
 
-- **Turn 1 (cold)** — pays full cost once (large prompt + tool schema + first prefill). Unavoidable.
-- **Every later turn with small new content** — should return in **a few seconds wall-clock**, not another ~8s cold start.
-- **After a tool result** — the “continue with tool output” turn is the common hot path; it must be fast and reliable.
+**Tool-split** is the fix: **pull tools out of the conversation path.**
 
-If cache is working but the user still waits 15s per message, we have not succeeded.
+- Tool schemas live in their own pinned memory (thin KV slots).
+- The chat history stays clean for PFlash and prefix cache.
+- Tools no longer drag down the algorithm that makes multi-turn chat fast.
 
-## Primary technical goal
+Pay the full cost once. After that — especially after a tool result comes back — the agent should feel snappy.
 
-Make **multi-turn tool-calling on Lucebox/DFlash fast and reliable** on:
+## What users should feel
 
-`model-runner-v4` → lucebox (:8080) → ai-platform proxy (:8000)
+- **Turn 1 (cold)** — full cost once (tools + first message). Expected.
+- **Later turns with a little new text** — a few seconds, not another cold start.
+- **After a tool result** — the common “continue” path must be fast and reliable.
 
-Mechanisms:
+If the cache is “working” but people still wait 15 seconds per message, we have not succeeded.
 
-1. **Tool KV pinned** — reuse tool-schema prefix (`SNAPSHOT_THIN` / thin slots). Saves re-prefilling ~376 tool tokens every turn.
-2. **Conversation prefix cached** — reuse conv history (`RESTORE_CHAIN thick=0` + inline snapshots). Saves re-prefilling everything before the latest user turn.
-3. **VRAM discipline** — one conv prefix slot, updated in-place (`DFLASH_PREFIX_CACHE_SLOTS=1`). Multiple thick snapshots OOM on 2×24GB and **silently disable all speedups**.
+## How it works (short version)
+
+1. **Pin tools separately** — tool schemas sit in thin snapshot slots (`SNAPSHOT_THIN`). No re-prefill of hundreds of tool tokens every turn.
+2. **Cache conversation alone** — chat history uses `RESTORE_CHAIN` + prefix cache so PFlash can focus on what it does best.
+3. **Respect VRAM** — one conversation prefix slot, updated in place (`DFLASH_PREFIX_CACHE_SLOTS=1` on 2×24GB). Extra thick snapshots can OOM and **silently kill every speedup**.
+
+Stack: `model-runner-v4` → lucebox (:8080) → ai-platform proxy (:8000)
 
 ## Practical success criteria
 
@@ -42,7 +48,7 @@ Mechanisms:
 | 2 (bigger delta) | ~6s | ~2240 | still prefills new messages — **not the main win** |
 | 3 (tiny delta) | **~3.7s** | **~120** | **21× prefill speedup** — this is the usable win |
 
-**Key insight:** Speedup is proportional to **how many new prompt tokens** you add. Small follow-ups feel fast; large new user messages still cost prefill time. That is expected and usable — agents usually add small tool results or short replies between turns.
+**Key insight:** Speedup tracks **how many new prompt tokens** you add. Small follow-ups feel fast; huge new user messages still cost prefill. That is expected — agents usually add short tool results or short replies between turns.
 
 ## What “done” is not
 
@@ -52,7 +58,7 @@ Mechanisms:
 
 ## One-line summary
 
-**Pay full prefill once per session; every small follow-up (especially after tool results) should feel snappy.**
+**Split tools out so PFlash can speed up the conversation — pay full prefill once; every small follow-up (especially after tool results) should feel snappy.**
 
 ## Infrastructure reference
 
@@ -62,7 +68,7 @@ Mechanisms:
 | Patch scripts | `model-runner-v4/lucebox-patch/dflash/scripts/` |
 | Daemon binary | `lucebox-hub-src/dflash/build/test_dflash` |
 | Benchmark | `model-runner-v4/scripts/benchmark-tool-split.py` |
-| Goal doc | `lucebox-hub/dflash/docs/tool-split-goal.md` |
+| Goal doc | `server/docs/tool-split-goal.md` |
 
 ## Key env
 
@@ -83,7 +89,7 @@ DFLASH_LAYER_SPLIT=0
 
 ## Remaining work for production-grade practical speed
 
-- [ ] Agent-realistic benchmark phase (user → tool_call → tool result → continue)
+- [x] Agent-realistic benchmark phase (user → tool_call → tool result → continue)
 - [ ] Bake patch + binary into image (no host-mount drift)
 - [ ] CI gate: incremental turn `elapsed_s` &lt; 4s, `prefill_ms` &lt; 500ms
 - [ ] Soak test: 50 sessions without daemon death or OOM
