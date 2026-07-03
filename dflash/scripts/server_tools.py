@@ -565,6 +565,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 snap_prep=snap_prep,
                 pending_tool_snap=tool_ctx.pending_tool_snap,
             )
+            # On chain restore with a thick conv slot, always refresh that
+            # slot in-place — never allocate a new prefix snapshot while thin
+            # tool KV is also resident (OOM on 24GB cards).
+            if (
+                snap_prep
+                and plan.conv_restore_slot is not None
+                and plan.conv_restore_slot >= 0
+            ):
+                slot, cut = snap_prep
+                if slot != plan.conv_restore_slot:
+                    snap_prep = (plan.conv_restore_slot, cut)
             cmd = tool_split.format_daemon_command(plan, gen_len)
             print(
                 f"  [tool-split] RESTORE_CHAIN thick={plan.conv_restore_slot} "
@@ -1604,6 +1615,15 @@ def main():
         adapter = resolve_tool_split_adapter(
             tool_split_cfg, arch=arch, tokenizer_id=tokenizer_id)
         if adapter is not None:
+            # One conv prefix slot (updated in-place) + thin tool pins fits
+            # 2×24GB; multiple thick snapshots OOM and disable cache speedups.
+            if tool_split_cfg.pinned_tool_slots > 0 and args.prefix_cache_slots > 1:
+                print(
+                    f"  [cfg] tool-split: clamping prefix_cache_slots "
+                    f"{args.prefix_cache_slots} → 1 (VRAM)",
+                    flush=True,
+                )
+                args.prefix_cache_slots = 1
             if tool_split_cfg.pinned_tool_slots > 0:
                 total_slots = (
                     args.prefix_cache_slots

@@ -649,6 +649,11 @@ class PrefixCache:
         if reuse_slot is not None and reuse_slot in self._populated_slots:
             slot = reuse_slot
             self._pending_evict_key = None
+        elif not self._populated_slots:
+            # First successful snap always lands in slot 0 so later turns
+            # refresh in-place (no second full PrefixSnapshot alloc).
+            slot = 0
+            self._pending_evict_key = None
         elif len(self.entries) >= self.cap:
             # Peek at LRU without removing.
             old_key = next(iter(self.entries))
