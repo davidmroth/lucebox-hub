@@ -21,24 +21,42 @@ from tool_split.qwen3 import Qwen3ToolSplitAdapter  # noqa: E402
 
 
 class _FakeTokenizer:
-    """Minimal tokenizer stub for split tests."""
+    """Qwen-shaped tokenizer stub for split tests.
+
+    Renders ``<|im_start|>role ... <|im_end|>`` framing (like the real Qwen3
+    chat template) and encodes the special markers + role words as single
+    tokens so ``_tool_prefix_boundary`` can find the first user turn.
+    """
+
+    _SPECIALS = ["<|im_start|>", "<|im_end|>", "system", "user", "assistant"]
 
     def apply_chat_template(self, messages, **kwargs):
         parts = []
-        if kwargs.get("tools"):
-            parts.append("<tools>")
-            for t in kwargs["tools"]:
-                parts.append(t["function"]["name"])
-            parts.append("</tools>")
+        first = True
         for m in messages:
-            parts.append(f"<{m['role']}>{m.get('content', '')}")
+            body = m.get("content", "") or ""
+            if first and kwargs.get("tools"):
+                names = ",".join(t["function"]["name"] for t in kwargs["tools"])
+                body += f"<tools>{names}</tools>"
+            parts.append(f"<|im_start|>{m['role']}\n{body}<|im_end|>\n")
+            first = False
         if kwargs.get("add_generation_prompt", True):
-            parts.append("<assistant>")
+            parts.append("<|im_start|>assistant\n")
         return "".join(parts)
 
     def encode(self, text, add_special_tokens=False):
-        # One token per character for easy slicing tests.
-        return [ord(c) for c in text]
+        ids = []
+        i = 0
+        while i < len(text):
+            for si, s in enumerate(self._SPECIALS):
+                if text.startswith(s, i):
+                    ids.append(1000 + si)
+                    i += len(s)
+                    break
+            else:
+                ids.append(ord(text[i]))
+                i += 1
+        return ids
 
 
 class TestRegistry(unittest.TestCase):
