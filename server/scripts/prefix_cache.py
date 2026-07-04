@@ -85,6 +85,12 @@ class DaemonStdoutBus:
     _DFLASH_TIMING_RE = re.compile(
         r"\[dflash\] generated (\d+) tokens in ([\d.]+) s\s+->\s+([\d.]+) tok/s"
     )
+    _DFLASH_ACCEPT_RE = re.compile(
+        r"\[dflash\] (\d+) draft steps, accepted=(\d+)/(\d+) \(([\d.]+)% per step\), "
+        r"avg commit/step=([\d.]+)"
+    )
+
+    _STEP_TIMING_LINE_RE = re.compile(r"^  ([a-z_]+|----- sum)\s+([\d.]+)$")
 
     def __init__(self, stdout):
         self.stdout = stdout
@@ -92,6 +98,7 @@ class DaemonStdoutBus:
         self._task: asyncio.Task | None = None
         self._request_inline_slot: int | None = None
         self._timings: dict[str, float | int] = {}
+        self._in_step_timing_block = False
 
     def begin_request(self) -> None:
         """Reset per-request daemon telemetry (inline snap ack, timings, etc.)."""
@@ -107,6 +114,18 @@ class DaemonStdoutBus:
         return dict(self._timings)
 
     def _parse_timing_line(self, decoded: str) -> None:
+        # Per-step timing block: "[timing] per-step averages ..." followed by
+        # indented "  name  ms" lines. Captured into step_ms_* keys.
+        if decoded.startswith("[timing] per-step averages"):
+            self._in_step_timing_block = True
+            return
+        if self._in_step_timing_block:
+            m = self._STEP_TIMING_LINE_RE.match(decoded)
+            if m:
+                key = m.group(1).replace("----- ", "")
+                self._timings[f"step_ms_{key}"] = float(m.group(2))
+                return
+            self._in_step_timing_block = False
         m = self._PREFILL_TIMING_RE.search(decoded)
         if m:
             self._timings["prefill_tokens"] = int(m.group(1))
@@ -118,6 +137,12 @@ class DaemonStdoutBus:
             gen_s = float(m.group(2))
             self._timings["decode_ms"] = round(gen_s * 1000.0, 2)
             self._timings["decode_tokens_per_sec"] = round(float(m.group(3)), 2)
+            return
+        m = self._DFLASH_ACCEPT_RE.search(decoded)
+        if m:
+            self._timings["draft_steps"] = int(m.group(1))
+            self._timings["draft_accept_pct"] = float(m.group(4))
+            self._timings["avg_commit_per_step"] = float(m.group(5))
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._task = loop.create_task(self._run())

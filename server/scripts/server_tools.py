@@ -518,8 +518,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         }
         timings: dict[str, float | int] = {}
         raw = bus.request_timings()
-        for key in ("prefill_ms", "decode_ms", "decode_tokens_per_sec"):
-            val = raw.get(key)
+        for key, val in raw.items():
             if isinstance(val, (int, float)) and val > 0:
                 timings[key] = val
         if conv_prefix_len is not None and conv_prefix_len > 0:
