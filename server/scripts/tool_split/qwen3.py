@@ -49,40 +49,17 @@ class Qwen3ToolSplitAdapter(ToolSplitAdapter):
             tokenizer, messages, canon, chat_template_kwargs, enable_thinking,
         )
 
-        # Stable prefix: system messages (if any) + tool definitions, no user turn.
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        tool_prefix_ids: list[int] = []
-        conv_ids: list[int]
-
-        if system_msgs:
-            tool_prefix_ids = self._encode_full(
-                tokenizer,
-                system_msgs,
-                canon,
-                chat_template_kwargs,
-                enable_thinking=False,
-                add_generation_prompt=False,
-            )
-            if tool_prefix_ids and full_ids[: len(tool_prefix_ids)] == tool_prefix_ids:
-                conv_ids = full_ids[len(tool_prefix_ids) :]
-            else:
-                boundary = self._tool_prefix_boundary(tokenizer, full_ids)
-                if boundary < 0:
-                    tool_prefix_ids = []
-                    conv_ids = full_ids
-                else:
-                    tool_prefix_ids = full_ids[:boundary]
-                    conv_ids = full_ids[boundary:]
+        # Slice the full rendered prompt at the tool/system boundary.
+        # Do NOT call apply_chat_template on system-only messages: Qwen3.6
+        # templates raise "No user query found in messages" when tools= is set
+        # without a user turn (Hermes webchat always hits this path).
+        boundary = self._tool_prefix_boundary(tokenizer, full_ids)
+        if boundary < 0:
+            tool_prefix_ids: list[int] = []
+            conv_ids = full_ids
         else:
-            # No explicit system message — tools inject into the default system
-            # block. Never call apply_chat_template([]); slice at first user turn.
-            boundary = self._tool_prefix_boundary(tokenizer, full_ids)
-            if boundary < 0:
-                tool_prefix_ids = []
-                conv_ids = full_ids
-            else:
-                tool_prefix_ids = full_ids[:boundary]
-                conv_ids = full_ids[boundary:]
+            tool_prefix_ids = full_ids[:boundary]
+            conv_ids = full_ids[boundary:]
 
         return PromptSplit(
             full_ids=full_ids,
