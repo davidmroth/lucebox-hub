@@ -74,7 +74,7 @@ Slot layout (8 daemon slots max): ``[prefix LRU][full compress][tool pins]``.
 
 ```
 ToolSplitAdapter.split_prompt() → PromptSplit
-  tool_prefix_ids  → pinned ToolSlotCache (RESTORE_CHAIN thick slot)
+  tool_prefix_ids  → pinned ToolSlotCache (RESTORE_CHAIN thin slot / SNAPSHOT_THIN)
   conversation_ids → PFlash + PrefixCache inline snap
 ```
 

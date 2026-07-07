@@ -264,6 +264,22 @@ def first_stop_match(text: str, stops: list[str]) -> int:
     return best
 
 
+def trim_at_stop(text: str, stops: list[str]) -> tuple[str, str | None]:
+    """Trim *text* at the first stop sequence. Returns (trimmed, matched_stop)."""
+    if not stops:
+        return text, None
+    best_i = -1
+    matched: str | None = None
+    for s in stops:
+        i = text.find(s)
+        if i != -1 and (best_i == -1 or i < best_i):
+            best_i = i
+            matched = s
+    if best_i == -1:
+        return text, None
+    return text[:best_i], matched
+
+
 def parse_reasoning(text: str, thinking_enabled: bool = True) -> tuple[str, str | None]:
     """Port of vLLM's Qwen3ReasoningParser.extract_reasoning.
 
@@ -504,6 +520,32 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             await bus.drain_inline_snap()
             prefix_cache.finish_inline_snap(
                 snap_prep, prompt_ids, inline_slot=bus.inline_snap_slot())
+
+    def _abort_full_snap_if_needed(full_snap_prep) -> None:
+        if full_snap_prep is not None:
+            fslot, _ = full_snap_prep
+            prefix_cache.abort_full_snap(fslot)
+
+    async def _finalize_request_snaps(
+        *,
+        full_snap_prep,
+        snap_prep: tuple[int, int] | None,
+        prompt_ids: list[int],
+        cur_bin: Path,
+        cur_ids: list[int] | None,
+        success: bool,
+    ) -> None:
+        if full_snap_prep is not None:
+            if success and cur_ids is not None:
+                fslot, _ = full_snap_prep
+                prefix_cache.confirm_full_snap(
+                    fslot, prompt_ids, cur_bin, len(cur_ids))
+            else:
+                _abort_full_snap_if_needed(full_snap_prep)
+        elif success:
+            await _finish_inline_snap(snap_prep, prompt_ids)
+        elif snap_prep:
+            prefix_cache.abort_inline_snap(snap_prep[0])
 
     def _build_usage(
         prompt_len: int,
@@ -801,10 +843,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             if generated >= n_gen:
                 hit_stop = True
 
-    async def _drain_pipe_to_sentinel():
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: list(_token_stream(r_pipe, 0)))
-
     def _max_gen_tokens(req: ChatRequest) -> int:
         if req.max_completion_tokens is not None:
             return req.max_completion_tokens
@@ -864,6 +902,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         available_gen = max_ctx - prompt_len - 20
         gen_len = min(_max_gen_tokens(req), available_gen)
         if gen_len <= 0:
+            _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
                 try: cur_bin.unlink()
                 except Exception: pass
@@ -911,13 +950,29 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             bus.begin_request()
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
-            tokens = await asyncio.to_thread(list, _token_stream(r_pipe, gen_len))
-            await bus.drain_timings()
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-            else:
-                await _finish_inline_snap(snap_prep, prompt_ids)
+            snap_ok = False
+            try:
+                tokens = await asyncio.to_thread(list, _token_stream(r_pipe, gen_len))
+                await bus.drain_timings()
+                snap_ok = True
+            except Exception:
+                await _finalize_request_snaps(
+                    full_snap_prep=full_snap_prep,
+                    snap_prep=snap_prep,
+                    prompt_ids=prompt_ids,
+                    cur_bin=cur_bin,
+                    cur_ids=cur_ids,
+                    success=False,
+                )
+                raise
+            await _finalize_request_snaps(
+                full_snap_prep=full_snap_prep,
+                snap_prep=snap_prep,
+                prompt_ids=prompt_ids,
+                cur_bin=cur_bin,
+                cur_ids=cur_ids,
+                success=snap_ok,
+            )
             await _commit_tool_snap_if_needed(tool_ctx)
         if full_hit is None:
             try: cur_bin.unlink()
@@ -1020,6 +1075,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         return None
                     return f"data: {json.dumps(chunk({kind: text}))}\n\n"
 
+                snap_ok = False
                 try:
                     async for tok_id in iterate_in_threadpool(_token_stream(r_pipe, gen_len)):
                         completion_tokens += 1
@@ -1103,12 +1159,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             yield f"data: {json.dumps(usage_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
                         await bus.drain_timings()
-                        if full_snap_prep is not None:
-                            fslot, _ = full_snap_prep
-                            prefix_cache.confirm_full_snap(
-                                fslot, prompt_ids, prompt_bin, len(cur_ids))
-                        else:
-                            await _finish_inline_snap(snap_prep, prompt_ids)
+                        await _finalize_request_snaps(
+                            full_snap_prep=full_snap_prep,
+                            snap_prep=snap_prep,
+                            prompt_ids=prompt_ids,
+                            cur_bin=prompt_bin,
+                            cur_ids=cur_ids,
+                            success=True,
+                        )
                         await _commit_tool_snap_if_needed(tool_ctx)
                         if full_hit is None:
                             try: prompt_bin.unlink()
@@ -1144,17 +1202,31 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             # Unclosed <tool_call> — emit raw as content fallback.
                             out = emit_delta(tool_buffer, "content")
                             if out: yield out
+                    snap_ok = True
+                except Exception:
+                    await _finalize_request_snaps(
+                        full_snap_prep=full_snap_prep,
+                        snap_prep=snap_prep,
+                        prompt_ids=prompt_ids,
+                        cur_bin=prompt_bin,
+                        cur_ids=cur_ids,
+                        success=False,
+                    )
+                    raise
                 finally:
                     if full_hit is None:
                         try: prompt_bin.unlink()
                         except Exception: pass
 
                 await bus.drain_timings()
-                if full_snap_prep is not None:
-                    fslot, _ = full_snap_prep
-                    prefix_cache.confirm_full_snap(fslot, prompt_ids, prompt_bin, len(cur_ids))
-                else:
-                    await _finish_inline_snap(snap_prep, prompt_ids)
+                await _finalize_request_snaps(
+                    full_snap_prep=full_snap_prep,
+                    snap_prep=snap_prep,
+                    prompt_ids=prompt_ids,
+                    cur_bin=prompt_bin,
+                    cur_ids=cur_ids,
+                    success=snap_ok,
+                )
                 await _commit_tool_snap_if_needed(tool_ctx)
 
                 yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
@@ -1299,6 +1371,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         available_gen = max_ctx - prompt_len - 20
         gen_len = min(req.max_tokens, available_gen)
         if gen_len <= 0:
+            _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
                 try: cur_bin.unlink()
                 except Exception: pass
@@ -1316,6 +1389,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 status_code=400)
 
         msg_id = "msg_" + uuid.uuid4().hex[:24]
+        user_stops = normalize_stop(req.stop_sequences)
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
@@ -1365,15 +1439,70 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     daemon_proc.stdin.flush()
 
                     out_tokens = 0
+                    stop_reason = "end_turn"
+                    matched_stop: str | None = None
+                    holdback = max((len(s) for s in user_stops), default=0)
+                    window = ""
+                    snap_ok = False
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len):
                             out_tokens += 1
-                            delta = {
-                                "type": "content_block_delta", "index": 0,
-                                "delta": {"type": "text_delta",
-                                          "text": tokenizer.decode([tok_id])},
-                            }
-                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                            piece = tokenizer.decode([tok_id])
+                            if user_stops:
+                                window += piece
+                                si = first_stop_match(window, user_stops)
+                                if si != -1:
+                                    for s in user_stops:
+                                        if window[si:si + len(s)] == s:
+                                            matched_stop = s
+                                            break
+                                    emit = window[:si]
+                                    stop_reason = "stop_sequence"
+                                    if emit:
+                                        delta = {
+                                            "type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "text_delta", "text": emit},
+                                        }
+                                        yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                                    break
+                                if len(window) > holdback:
+                                    emit = window[:-holdback]
+                                    window = window[-holdback:]
+                                    if emit:
+                                        delta = {
+                                            "type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "text_delta", "text": emit},
+                                        }
+                                        yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                            else:
+                                delta = {
+                                    "type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "text_delta", "text": piece},
+                                }
+                                yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                        else:
+                            if user_stops and window:
+                                trimmed, matched_stop = trim_at_stop(window, user_stops)
+                                if matched_stop is not None:
+                                    stop_reason = "stop_sequence"
+                                    window = trimmed
+                                if window:
+                                    delta = {
+                                        "type": "content_block_delta", "index": 0,
+                                        "delta": {"type": "text_delta", "text": window},
+                                    }
+                                    yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                        snap_ok = True
+                    except Exception:
+                        await _finalize_request_snaps(
+                            full_snap_prep=full_snap_prep,
+                            snap_prep=snap_prep,
+                            prompt_ids=prompt_ids,
+                            cur_bin=cur_bin,
+                            cur_ids=cur_ids,
+                            success=False,
+                        )
+                        raise
                     finally:
                         if full_hit is None:
                             try: cur_bin.unlink()
@@ -1386,17 +1515,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             try: prompt_bin.unlink()
                             except Exception: pass
 
-                    if full_snap_prep is not None:
-                        fslot, _ = full_snap_prep
-                        prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-                    else:
-                        await _finish_inline_snap(snap_prep, prompt_ids)
+                    await _finalize_request_snaps(
+                        full_snap_prep=full_snap_prep,
+                        snap_prep=snap_prep,
+                        prompt_ids=prompt_ids,
+                        cur_bin=cur_bin,
+                        cur_ids=cur_ids,
+                        success=snap_ok,
+                    )
 
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
 
                     msg_delta = {
                         "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "delta": {
+                            "stop_reason": stop_reason,
+                            "stop_sequence": matched_stop,
+                        },
                         "usage": {"output_tokens": out_tokens},
                     }
                     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
@@ -1431,12 +1566,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             bus.begin_request()
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
-            tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-            else:
-                await _finish_inline_snap(snap_prep, prompt_ids)
+            snap_ok = False
+            try:
+                tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
+                snap_ok = True
+            except Exception:
+                await _finalize_request_snaps(
+                    full_snap_prep=full_snap_prep,
+                    snap_prep=snap_prep,
+                    prompt_ids=prompt_ids,
+                    cur_bin=cur_bin,
+                    cur_ids=cur_ids,
+                    success=False,
+                )
+                raise
+            await _finalize_request_snaps(
+                full_snap_prep=full_snap_prep,
+                snap_prep=snap_prep,
+                prompt_ids=prompt_ids,
+                cur_bin=cur_bin,
+                cur_ids=cur_ids,
+                success=snap_ok,
+            )
 
         if full_hit is None:
             try: cur_bin.unlink()
@@ -1449,14 +1600,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             try: prompt_bin.unlink()
             except Exception: pass
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        text, matched_stop = trim_at_stop(text, user_stops)
+        stop_reason = "stop_sequence" if matched_stop else "end_turn"
         return JSONResponse({
             "id": msg_id,
             "type": "message",
             "role": "assistant",
             "model": req.model or MODEL_NAME,
             "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
+            "stop_reason": stop_reason,
+            "stop_sequence": matched_stop,
             "usage": {"input_tokens": prompt_len,
                       "output_tokens": len(tokens)},
         })

@@ -31,11 +31,17 @@ class MyVendorToolSplitAdapter(ToolSplitAdapter):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         enable_thinking: bool = False,
     ) -> PromptSplit:
-        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
         if tools:
             kwargs["tools"] = list(tools)
         if chat_template_kwargs:
-            kwargs.update(dict(chat_template_kwargs))
+            for k, v in chat_template_kwargs.items():
+                if k in ("enable_thinking", "add_generation_prompt", "tools"):
+                    kwargs[k] = v
         prompt = tokenizer.apply_chat_template(list(messages), **kwargs)
         full_ids = tokenizer.encode(prompt, add_special_tokens=False)
         # TODO: locate tool-schema token boundary for your template.

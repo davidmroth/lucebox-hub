@@ -85,45 +85,63 @@ class ToolSlotCache:
 
     Slot IDs stay in ``[slot_base, slot_base + pinned_slots)``. Eviction reuses
     the LRU entry's slot so RESTORE_CHAIN never references out-of-range IDs.
+
+    Eviction is deferred from ``reserve()`` to ``confirm()`` so a failed
+    ``SNAPSHOT_THIN`` can call ``release_reservation()`` without losing the
+    previous anchor (same pattern as ``PrefixCache.prepare_inline_snap``).
     """
 
     def __init__(self, *, pinned_slots: int, slot_base: int = 0):
         self.pinned_slots = max(0, pinned_slots)
         self.slot_base = slot_base
-        self._entries: OrderedDict[str, int] = OrderedDict()
+        self._confirmed: OrderedDict[str, int] = OrderedDict()
+        self._pending: dict[str, int] = {}
+        self._pending_evict: tuple[str, int] | None = None
 
     def lookup(self, fingerprint: str) -> int | None:
-        if fingerprint in self._entries:
-            self._entries.move_to_end(fingerprint)
-            return self._entries[fingerprint]
+        if fingerprint in self._pending:
+            return None
+        if fingerprint in self._confirmed:
+            self._confirmed.move_to_end(fingerprint)
+            return self._confirmed[fingerprint]
         return None
 
     def reserve(self, fingerprint: str) -> int:
         if self.pinned_slots <= 0:
             raise ValueError("ToolSlotCache.reserve requires pinned_slots > 0")
-        if fingerprint in self._entries:
-            self._entries.move_to_end(fingerprint)
-            return self._entries[fingerprint]
-        if len(self._entries) >= self.pinned_slots:
-            # Reuse the LRU slot so IDs stay in [slot_base, slot_base+pinned_slots).
-            _, slot = self._entries.popitem(last=False)
+        if fingerprint in self._confirmed:
+            self._confirmed.move_to_end(fingerprint)
+            return self._confirmed[fingerprint]
+        if fingerprint in self._pending:
+            return self._pending[fingerprint]
+        if len(self._confirmed) >= self.pinned_slots:
+            # Peek LRU without evicting — eviction happens in confirm().
+            old_fp, slot = next(iter(self._confirmed.items()))
+            self._pending_evict = (old_fp, slot)
         else:
-            used = set(self._entries.values())
+            used = set(self._confirmed.values()) | set(self._pending.values())
             slot = next(
                 s for s in range(self.slot_base, self.slot_base + self.pinned_slots)
                 if s not in used
             )
-        self._entries[fingerprint] = slot
+            self._pending_evict = None
+        self._pending[fingerprint] = slot
         return slot
 
     def confirm(self, fingerprint: str, slot: int) -> None:
-        self._entries[fingerprint] = slot
-        self._entries.move_to_end(fingerprint)
+        if self._pending_evict is not None:
+            evict_fp, _ = self._pending_evict
+            self._confirmed.pop(evict_fp, None)
+            self._pending_evict = None
+        self._pending.pop(fingerprint, None)
+        self._confirmed[fingerprint] = slot
+        self._confirmed.move_to_end(fingerprint)
 
     def release_reservation(self, fingerprint: str, slot: int) -> None:
         """Drop a fingerprint reserved before SNAPSHOT_THIN succeeded."""
-        if self._entries.get(fingerprint) == slot:
-            del self._entries[fingerprint]
+        if self._pending.get(fingerprint) == slot:
+            del self._pending[fingerprint]
+        self._pending_evict = None
 
 
 class ToolSplitOrchestrator:

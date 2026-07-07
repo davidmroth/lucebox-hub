@@ -1203,6 +1203,17 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "snapshot backend init failed\n");
         return 1;
     }
+    struct SnapBackendGuard {
+        ggml_backend_t * snap;
+        ggml_backend_t target;
+        SnapBackendGuard(ggml_backend_t * s, ggml_backend_t t) : snap(s), target(t) {}
+        ~SnapBackendGuard() {
+            if (snap && *snap) {
+                dflash::common::free_snapshot_backend(*snap, target);
+                *snap = nullptr;
+            }
+        }
+    } snap_guard(&snap_backend, target_backend);
 
     TargetWeights w;
     if (!load_target_gguf(target_path, target_backend, w)) {
@@ -2562,8 +2573,8 @@ int main(int argc, char ** argv) {
                 }
                 // Optional inline-snap suffix (same as RESTORE / bare prompt):
                 // snap=<pos>:<slot_id>
-                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
-                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                if (const char * sp = std::strstr(line.c_str(), " snap=")) {
+                    if (std::sscanf(sp + 1, "snap=%d:%d", &snap_pos, &snap_slot) != 2
                         || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
                         std::fprintf(stderr, "[snap] bad inline-snap arg\n");
                         snap_pos = -1; snap_slot = -1;
@@ -2591,8 +2602,8 @@ int main(int argc, char ** argv) {
                 restore_from_slot = true;
                 restore_slot_id   = slot;
                 // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
-                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
-                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                if (const char * sp = std::strstr(line.c_str(), " snap=")) {
+                    if (std::sscanf(sp + 1, "snap=%d:%d", &snap_pos, &snap_slot) != 2
                         || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
                         std::fprintf(stderr, "[snap] bad inline-snap arg\n");
                         snap_pos = -1; snap_slot = -1;
@@ -2607,8 +2618,8 @@ int main(int argc, char ** argv) {
                 prompt_file_str = ppath;
                 prompt_path = prompt_file_str.c_str();
                 // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
-                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
-                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                if (const char * sp = std::strstr(line.c_str(), " snap=")) {
+                    if (std::sscanf(sp + 1, "snap=%d:%d", &snap_pos, &snap_slot) != 2
                         || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
                         std::fprintf(stderr, "[snap] bad inline-snap arg\n");
                         snap_pos = -1; snap_slot = -1;
@@ -4180,7 +4191,6 @@ int main(int argc, char ** argv) {
     if (daemon_mode) {
         for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) free_prefix_snapshot(prefix_snapshots[i]);
     }
-    dflash::common::free_snapshot_backend(snap_backend, target_backend);
     step_graph_destroy(sg);
     free_target_cache(cache);
     free_draft_weights(dw);

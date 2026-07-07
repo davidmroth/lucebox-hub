@@ -757,6 +757,11 @@ class PrefixCache:
         if self._pending_evict_key is not None:
             self.entries.pop(self._pending_evict_key, None)
             self._pending_evict_key = None
+        # reuse_slot path: no pending evict, but daemon may have committed new KV.
+        stale_keys = [k for k, s in self.entries.items() if s == slot]
+        for k in stale_keys:
+            del self.entries[k]
+        self._slot_prefix_len.pop(slot, None)
 
     # ------------------------------------------------------------------
     # Option 3: full-compress-result cache
@@ -925,12 +930,19 @@ class PrefixCache:
     def abort_full_snap(self, slot: int) -> None:
         """Cancel a prepare_full_snap reservation without registering anything.
 
-        Clears the pending eviction so the old LRU entry is not evicted.
+        Clears the pending eviction so the old LRU entry is not evicted. If the
+        daemon may have committed KV to *slot* before the failure, also drop
+        stale hash→slot mappings (conservative, same as abort_inline_snap).
         """
         if getattr(self, "_full_disabled", True):
             return
-        self._full_pending_evict_key = None
-        self._full_pending_evict_path = None
+        if self._full_pending_evict_key is not None:
+            self.full_entries.pop(self._full_pending_evict_key, None)
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+        stale_keys = [k for k, (s, _, _) in self.full_entries.items() if s == slot]
+        for k in stale_keys:
+            self.full_entries.pop(k, None)
 
     # Legacy out-of-band snapshot (kept for backward-compatibility tests
     # that call it directly; new code uses prepare_inline_snap +

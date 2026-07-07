@@ -78,6 +78,41 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
         self.assertEqual(pc.entries[deep], 0)
         self.assertEqual(pc._slot_prefix_len[0], 480)
 
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_abort_inline_snap_purges_reuse_slot_mappings(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376]
+
+        key = hash_prefix(ids[:376], pc.kv_k_type, pc.fa_window)
+        pc.entries[key] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 376
+
+        prep = pc.prepare_inline_snap(ids, reuse_slot=0)
+        self.assertIsNotNone(prep)
+        slot, _ = prep
+        pc.abort_inline_snap(slot)
+
+        self.assertNotIn(key, pc.entries)
+        self.assertNotIn(0, pc._slot_prefix_len)
+
+    def test_abort_full_snap_purges_stale_lookup(self):
+        pc = self._make_cache()
+        pc.init_full_cache(1)
+        old_ids = list(range(200))
+        old_key = hash_prefix(old_ids, pc.kv_k_type, pc.fa_window)
+        pc.full_entries[old_key] = (pc._full_slot_base, "/tmp/old.bin", 100)
+
+        new_ids = list(range(300))
+        prep = pc.prepare_full_snap(new_ids)
+        self.assertIsNotNone(prep)
+        slot, _ = prep
+        self.assertEqual(pc._full_pending_evict_key, old_key)
+        pc.abort_full_snap(slot)
+
+        self.assertIsNone(pc.lookup_full(old_ids))
+
 
 if __name__ == "__main__":
     unittest.main()

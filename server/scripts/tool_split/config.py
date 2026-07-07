@@ -38,7 +38,11 @@ def config_from_env_and_args(args=None) -> ToolSplitConfig:
     profile = os.environ.get("DFLASH_TOOL_SPLIT_PROFILE", "auto")
     plugin_dir_raw = os.environ.get("DFLASH_TOOL_SPLIT_PLUGIN_DIR")
     plugin_dir = Path(plugin_dir_raw).expanduser() if plugin_dir_raw else None
-    pinned = int(os.environ.get("DFLASH_TOOL_SPLIT_PINNED_SLOTS", "2"))
+    pinned_raw = os.environ.get("DFLASH_TOOL_SPLIT_PINNED_SLOTS", "2")
+    try:
+        pinned = int(pinned_raw)
+    except ValueError:
+        pinned = 2
     compress_conv = _env_bool("DFLASH_TOOL_SPLIT_COMPRESS_CONV", True)
 
     if args is not None:
@@ -47,7 +51,7 @@ def config_from_env_and_args(args=None) -> ToolSplitConfig:
         if getattr(args, "tool_split_profile", None):
             profile = args.tool_split_profile
         if getattr(args, "tool_split_plugin_dir", None):
-            plugin_dir = args.tool_split_plugin_dir
+            plugin_dir = Path(args.tool_split_plugin_dir).expanduser()
         if getattr(args, "tool_split_pinned_slots", None) is not None:
             pinned = args.tool_split_pinned_slots
         if getattr(args, "tool_split_compress_conv", None) is not None:

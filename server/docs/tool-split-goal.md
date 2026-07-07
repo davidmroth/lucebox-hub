@@ -26,7 +26,7 @@ If the cache is “working” but people still wait 15 seconds per message, we h
 
 1. **Pin tools separately** — tool schemas sit in thin snapshot slots (`SNAPSHOT_THIN`). No re-prefill of hundreds of tool tokens every turn.
 2. **Cache conversation alone** — chat history uses `RESTORE_CHAIN` + prefix cache so PFlash can focus on what it does best.
-3. **Respect VRAM** — one conversation prefix slot, updated in place (`DFLASH_PREFIX_CACHE_SLOTS=1` on 2×24GB). Extra thick snapshots can OOM and **silently kill every speedup**.
+3. **Respect VRAM** — on 2×24GB, `DFLASH_PREFIX_CACHE_SLOTS=1` is a conservative default (one conversation slot, updated in place). Thick prefix snapshots live in CPU RAM, so additional slots are viable when `prefix + tool_pins ≤ DAEMON_MAX_SLOTS`. Extra thick snapshots can still OOM and **silently kill every speedup**.
 
 Stack: `model-runner-v4` → lucebox (:8080) → ai-platform proxy (:8000)
 
@@ -64,9 +64,9 @@ Stack: `model-runner-v4` → lucebox (:8080) → ai-platform proxy (:8000)
 
 | Item | Path / detail |
 |------|----------------|
-| Server | `david@192.168.87.153`, `/media/data/projects/` |
+| Server | `user@host`, `/path/to/projects/` |
 | Patch scripts | `model-runner-v4/lucebox-patch/dflash/scripts/` |
-| Daemon binary | `lucebox-hub-src/dflash/build/test_dflash` |
+| Daemon binary | `lucebox-hub/build/test_dflash` |
 | Benchmark | `model-runner-v4/scripts/benchmark-tool-split.py` |
 | Goal doc | `server/docs/tool-split-goal.md` |
 
@@ -74,7 +74,7 @@ Stack: `model-runner-v4` → lucebox (:8080) → ai-platform proxy (:8000)
 
 ```bash
 DFLASH_TOOL_SPLIT_ENABLED=1
-DFLASH_PREFIX_CACHE_SLOTS=1      # required for reliable cache on 2×24GB
+DFLASH_PREFIX_CACHE_SLOTS=1      # conservative default for 2×24GB; not a hard cap
 DFLASH_TOOL_SPLIT_PINNED_SLOTS=2
 DFLASH_LAYER_SPLIT=0
 ```

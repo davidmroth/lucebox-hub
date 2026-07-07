@@ -23,6 +23,10 @@ def register_adapter(name: str):
         key = name.strip().lower()
         if not key:
             raise ValueError("adapter name must be non-empty")
+        existing = _REGISTRY.get(key)
+        if existing is not None and existing is not cls:
+            raise ValueError(
+                f"tool-split adapter {key!r} is already registered as {existing.__name__}")
         cls.profile_name = key
         _REGISTRY[key] = cls
         return cls

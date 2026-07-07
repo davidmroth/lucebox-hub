@@ -120,5 +120,5 @@ class Qwen3ToolSplitAdapter(ToolSplitAdapter):
             user_seq = (qs[0], user_t[0])
             idx = _find_first_seq(full_ids, user_seq)
             if idx >= 0:
-                return idx + len(user_seq)
+                return idx + len(qs)
         return -1

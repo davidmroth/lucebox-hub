@@ -119,8 +119,50 @@ class TestQwen3Adapter(unittest.TestCase):
         self.assertEqual(split.tool_prefix_len, 0)
         self.assertEqual(split.conversation_ids, split.full_ids)
 
+    def test_tool_boundary_fallback_matches_marker_path(self):
+        from unittest.mock import patch
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "", "parameters": {}}}]
+        with patch("prefix_cache.find_prefix_boundary_markers", return_value=-1):
+            split = self.adapter.split_prompt(self.tok, messages, tools)
+        im_start = self.tok.encode("<|im_start|>", add_special_tokens=False)[0]
+        user_tok = self.tok.encode("user", add_special_tokens=False)[0]
+        seq = (im_start, user_tok)
+        idx = next(
+            i for i in range(len(split.full_ids) - 1)
+            if tuple(split.full_ids[i:i + 2]) == seq
+        )
+        self.assertEqual(split.tool_prefix_len, idx + 1)
+
 
 class TestConfig(unittest.TestCase):
+    def test_invalid_env_pinned_falls_back_with_cli_override(self):
+        import os
+        from unittest.mock import patch
+
+        class _Args:
+            tool_split_pinned_slots = 5
+
+        with patch.dict(os.environ, {"DFLASH_TOOL_SPLIT_PINNED_SLOTS": "not-a-number"}):
+            cfg = config_from_env_and_args(_Args())
+        self.assertEqual(cfg.pinned_tool_slots, 5)
+
+    def test_cli_plugin_dir_expands_user(self):
+        import os
+        from unittest.mock import patch
+
+        class _Args:
+            tool_split_plugin_dir = Path("~/tool_plugins")
+
+        with patch.dict(os.environ, {}, clear=False):
+            cfg = config_from_env_and_args(_Args())
+        self.assertTrue(str(cfg.plugin_dir).endswith("tool_plugins"))
+        self.assertNotIn("~", str(cfg.plugin_dir))
+
     def test_resolve_auto_qwen(self):
         cfg = ToolSplitConfig(enabled=True, profile="auto")
         adapter = resolve_adapter(cfg, arch="qwen36", tokenizer_id="Qwen/Qwen3.6-27B")
@@ -134,16 +176,20 @@ class TestToolSlotCache(unittest.TestCase):
 
         cache = ToolSlotCache(pinned_slots=2, slot_base=3)
         s0 = cache.reserve("a")
+        cache.confirm("a", s0)
         s1 = cache.reserve("b")
+        cache.confirm("b", s1)
         self.assertEqual({s0, s1}, {3, 4})
-        # Evict LRU ("a") and reuse its slot for "c".
+        # Reserve "c" — defers eviction of "a" until confirm.
         s2 = cache.reserve("c")
         self.assertEqual(s2, s0)
-        self.assertEqual(cache.lookup("a"), None)
+        self.assertEqual(cache.lookup("a"), s0)
+        self.assertIsNone(cache.lookup("c"))
+        cache.confirm("c", s2)
+        self.assertIsNone(cache.lookup("a"))
         self.assertEqual(cache.lookup("c"), s0)
         self.assertEqual(cache.lookup("b"), s1)
-        # All live slots stay in [3, 5).
-        self.assertTrue(all(3 <= s < 5 for s in cache._entries.values()))
+        self.assertTrue(all(3 <= s < 5 for s in cache._confirmed.values()))
 
     def test_release_reservation_frees_slot(self):
         from tool_split.orchestrator import ToolSlotCache
@@ -154,6 +200,20 @@ class TestToolSlotCache(unittest.TestCase):
         self.assertIsNone(cache.lookup("fp"))
         # Freed slot is reusable.
         self.assertEqual(cache.reserve("other"), slot)
+
+    def test_release_reservation_restores_evicted_anchor(self):
+        from tool_split.orchestrator import ToolSlotCache
+
+        cache = ToolSlotCache(pinned_slots=2, slot_base=3)
+        s0 = cache.reserve("a")
+        cache.confirm("a", s0)
+        s1 = cache.reserve("b")
+        cache.confirm("b", s1)
+        s2 = cache.reserve("c")
+        self.assertEqual(cache.lookup("a"), s0)
+        cache.release_reservation("c", s2)
+        self.assertEqual(cache.lookup("a"), s0)
+        self.assertIsNone(cache.lookup("c"))
 
 
 class TestCommitPendingToolSnap(unittest.IsolatedAsyncioTestCase):
