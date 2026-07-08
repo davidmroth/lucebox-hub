@@ -225,6 +225,21 @@ static void test_utf8_sanitize_empty() {
     TEST_ASSERT(utf8_sanitize("") == "");
 }
 
+static void test_emitter_splits_emoji_across_tokens() {
+    // 📉 UTF-8: F0 9F 93 89 — BPE can split multi-byte emoji across tokens.
+    const std::string emoji = "\xF0\x9F\x93\x89";
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_token(emoji.substr(0, 2));
+    em.emit_token(emoji.substr(2));
+    em.emit_token(" Losing");
+    em.emit_finish(3);
+
+    const std::string & text = em.accumulated_text();
+    TEST_ASSERT(text.find("\xEF\xBF\xBD") == std::string::npos);
+    TEST_ASSERT(text.find(emoji) != std::string::npos);
+    TEST_ASSERT(text.find(" Losing") != std::string::npos);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Reasoning parser tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -4363,6 +4378,7 @@ int main() {
     RUN_TEST(test_utf8_sanitize_valid);
     RUN_TEST(test_utf8_sanitize_replaces_invalid);
     RUN_TEST(test_utf8_sanitize_empty);
+    RUN_TEST(test_emitter_splits_emoji_across_tokens);
 
     std::fprintf(stderr, "\n── Reasoning parser ──\n");
     RUN_TEST(test_reasoning_basic);

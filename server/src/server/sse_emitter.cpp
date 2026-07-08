@@ -251,11 +251,20 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     }
     emit_token_count_++;
 
-    // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
-    std::string piece = utf8_sanitize(raw_piece);
+    // Hold incomplete UTF-8 sequences across token boundaries. Per-token
+    // utf8_sanitize() corrupts emoji split by BPE into U+FFFD (issue #emoji).
+    utf8_pending_ += raw_piece;
+    const size_t safe_len = utf8_safe_len(utf8_pending_, utf8_pending_.size());
+    std::string piece;
+    if (safe_len > 0) {
+        piece = utf8_pending_.substr(0, safe_len);
+        utf8_pending_.erase(0, safe_len);
+    }
     std::vector<std::string> out;
-    accumulated_raw_ += piece;
-    window_ += piece;
+    if (!piece.empty()) {
+        accumulated_raw_ += piece;
+        window_ += piece;
+    }
 
     // Stop sequence detection (not in tool_buffer mode, matching Python logic).
     if (!stop_sequences_.empty() && mode_ != StreamMode::TOOL_BUFFER) {
@@ -498,6 +507,16 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings) {
     std::vector<std::string> out;
+
+    // Flush any trailing partial UTF-8 bytes before the window flush.
+    if (!utf8_pending_.empty()) {
+        std::string tail = utf8_sanitize(utf8_pending_);
+        utf8_pending_.clear();
+        if (!tail.empty()) {
+            accumulated_raw_ += tail;
+            window_ += tail;
+        }
+    }
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {

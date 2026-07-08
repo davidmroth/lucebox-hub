@@ -144,6 +144,7 @@ private:
     ToolMemory * tool_memory_;
 
     StreamMode   mode_;
+    std::string  utf8_pending_;     // incomplete UTF-8 bytes held across token boundaries
     std::string  window_;           // holdback buffer
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;
