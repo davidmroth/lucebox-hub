@@ -22,6 +22,14 @@ namespace dflash::common {
 
 class KvFlashPager;
 
+// Optional attention overrides for multimodal prefill (mRoPE positions,
+// bidirectional image masks).  positions uses layer-split layout:
+// [dim0*n + i, dim1*n + i, dim2*n + i, dim3*n + i] for n query tokens.
+struct LayerSplitAttnPrefillOpts {
+    const int32_t * positions = nullptr;
+    bool bidirectional = false;
+};
+
 // Compute argmax(logits) for a slice of the activation tensor via
 // out_norm + lm_head projection.
 bool compute_target_split_argmax(
@@ -79,7 +87,8 @@ bool run_qwen35_layer_split_forward_from_activation(
         std::vector<float> * logits_out = nullptr,
         std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr,
         KvFlashPager * kvflash = nullptr,
-        bool kvflash_preallocated = false);
+        bool kvflash_preallocated = false,
+        const LayerSplitAttnPrefillOpts * attn_opts = nullptr);
 
 bool run_qwen35_mixed_layer_split_forward(
         std::vector<Qwen35LayerSplitShard> & local_shards,
