@@ -197,6 +197,8 @@ static void print_usage(const char * prog) {
         "\n"
         "Options:\n"
         "  --draft <path>       Draft model for speculative decode\n"
+        "  --mmproj <path>      Multimodal projector (mmproj) for native vision\n"
+        "  --no-mmproj-offload  Run mmproj on CPU (default: GPU offload)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -325,6 +327,7 @@ int main(int argc, char ** argv) {
     double spark_vram_gib = 0.0;   // --spark-vram: total VRAM target in GiB (0=use card)
     std::string cache_type_k;  // explicit --cache-type-k override
     std::string cache_type_v;  // explicit --cache-type-v override
+    std::string mmproj_path;   // --mmproj
     bool target_device_seen = false;
     bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
@@ -355,6 +358,13 @@ int main(int argc, char ** argv) {
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) {
+            mmproj_path = argv[++i];
+            bargs.mmproj_path = mmproj_path.c_str();
+            sconfig.mmproj_path = mmproj_path;
+            sconfig.vision_supported = true;
+        } else if (std::strcmp(argv[i], "--no-mmproj-offload") == 0) {
+            bargs.mmproj_use_gpu = false;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -626,6 +636,12 @@ int main(int argc, char ** argv) {
         }
     }
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
+
+    if (bargs.mmproj_path && bargs.draft_path) {
+        std::fprintf(stderr,
+            "[server] mmproj + draft loaded: DFlash for text-only requests, "
+            "AR decode for image requests\n");
+    }
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
 
@@ -996,6 +1012,8 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  port            = %d\n", sconfig.port);
     std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path);
     std::fprintf(stderr, "[server] │  draft           = %s\n", bargs.draft_path ? bargs.draft_path : "(none)");
+    std::fprintf(stderr, "[server] │  mmproj          = %s\n",
+                 bargs.mmproj_path ? bargs.mmproj_path : "(none)");
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
     // max_tokens default for requests that omit the field. The request
@@ -1114,6 +1132,7 @@ int main(int argc, char ** argv) {
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
     sconfig.speculative_enabled = bargs.ddtree_mode;
+    sconfig.vision_supported  = !sconfig.mmproj_path.empty();
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the auto-default
     // the daemon picks. Matches the printed table above.

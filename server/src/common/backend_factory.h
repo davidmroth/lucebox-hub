@@ -58,6 +58,10 @@ struct BackendArgs {
     bool            ddtree_chain_seed = true;
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
+
+    // Native mmproj vision (qwen35)
+    const char *    mmproj_path     = nullptr;
+    bool            mmproj_use_gpu  = true;
 };
 
 // ─── Factory function ───────────────────────────────────────────────────

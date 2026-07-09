@@ -189,6 +189,23 @@ endif()
 # Use only the ggml subtree of llama.cpp (skip libllama).
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
+# Optional native mmproj vision (mtmd + llama for tokenization/vocab).
+option(DFLASH27B_MMPROJ "Build native mmproj vision support via mtmd" OFF)
+if(DFLASH27B_MMPROJ)
+    set(LLAMA_BUILD_COMMON    OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS     OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER    OFF CACHE BOOL "" FORCE)
+    add_subdirectory(deps/llama.cpp EXCLUDE_FROM_ALL)
+    # mtmd is added as a sibling of llama.cpp (not via tools/) so
+    # LLAMA_INSTALL_VERSION must be visible in the parent scope.
+    if(NOT DEFINED LLAMA_INSTALL_VERSION)
+        set(LLAMA_INSTALL_VERSION "0.0.0")
+    endif()
+    add_subdirectory(deps/llama.cpp/tools/mtmd EXCLUDE_FROM_ALL)
+endif()
+
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # The vendored ggml HIP shim still uses a few CUDA spellings that are not
     # mapped in this submodule snapshot. Keep the compatibility layer in this
@@ -223,6 +240,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vision
 )
 
 add_library(dflash_common STATIC
@@ -329,7 +347,11 @@ add_library(dflash_common STATIC
     deps/llama.cpp/common/jinja/string.cpp
     deps/llama.cpp/common/jinja/caps.cpp
     deps/llama.cpp/common/unicode.cpp
+    src/vision/vision_input.cpp
 )
+if(DFLASH27B_MMPROJ)
+    target_sources(dflash_common PRIVATE src/vision/vision_encoder.cpp)
+endif()
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
 # run the spec-prefill stack or are building without CUDA BF16 WMMA support
@@ -522,6 +544,16 @@ if(DFLASH27B_ENABLE_BSA)
     else()
         target_sources(dflash_common PRIVATE src/bsa_fwd_inst.cu src/bsa_launcher.cu)
     endif()
+endif()
+
+if(DFLASH27B_MMPROJ)
+    target_compile_definitions(dflash_common PRIVATE DFLASH_HAVE_MMPROJ=1)
+    set(DFLASH27B_MMPROJ_INCLUDE_DIRS
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/tools/mtmd
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/vendor)
+    target_include_directories(dflash_common PRIVATE ${DFLASH27B_MMPROJ_INCLUDE_DIRS})
+    target_link_libraries(dflash_common PRIVATE llama mtmd)
 endif()
 
 target_include_directories(dflash_common
@@ -918,6 +950,10 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_server_unit PRIVATE hip::host)
         endif()
+        if(DFLASH27B_MMPROJ)
+            target_compile_definitions(test_server_unit PRIVATE DFLASH_HAVE_MMPROJ=1)
+            target_include_directories(test_server_unit PRIVATE ${DFLASH27B_MMPROJ_INCLUDE_DIRS})
+        endif()
         add_test(NAME server_unit COMMAND test_server_unit)
     endif()
 
@@ -1010,6 +1046,10 @@ if(DFLASH27B_SERVER)
             target_link_libraries(dflash_server PRIVATE CUDA::cudart)
         else()
             target_link_libraries(dflash_server PRIVATE hip::host)
+        endif()
+        if(DFLASH27B_MMPROJ)
+            target_compile_definitions(dflash_server PRIVATE DFLASH_HAVE_MMPROJ=1)
+            target_include_directories(dflash_server PRIVATE ${DFLASH27B_MMPROJ_INCLUDE_DIRS})
         endif()
 
         # Copy share/status.html next to the binary so it can be found at runtime.
