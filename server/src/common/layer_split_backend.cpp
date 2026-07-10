@@ -2,6 +2,7 @@
 
 #include "layer_split_backend.h"
 
+#include "internal.h"
 #include "io_utils.h"
 
 #include <chrono>
