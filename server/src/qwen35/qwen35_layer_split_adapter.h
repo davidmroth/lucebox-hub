@@ -86,6 +86,10 @@ public:
     void free_drafter() override;
 
     bool snapshot_save(int slot) override;
+    bool snapshot_save_thin(int slot, int kv_start, int kv_end) override;
+    bool snapshot_is_thin(int slot) const override;
+    bool apply_restore_chain(int thick_slot,
+                             const std::vector<int> & thin_slots) override;
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;

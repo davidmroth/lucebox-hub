@@ -7,7 +7,7 @@
 // Kept separate from daemon_loop.{h,cpp} because:
 //   - It manages multiple Qwen35LayerSplitShards instead of a single ModelBackend
 //   - Peer access / feature mirroring is shard-specific
-//   - SNAPSHOT/RESTORE are not supported in layer-split mode
+//   - SNAPSHOT_THIN / RESTORE_CHAIN supported via LayerSplitBackend
 
 #pragma once
 

@@ -428,21 +428,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
               tool_split: ToolSplitOrchestrator | None = None) -> FastAPI:
     import asyncio
     if _extra_daemon_has_target_sharding(extra_daemon_args):
-        if prefix_cache_slots > 0 or prefill_cache_slots > 0:
-            print(
-                "  [cfg] target-gpus sharding: disabling prefix/full cache "
-                "(daemon SNAPSHOT/RESTORE not implemented for this mode)",
-                flush=True,
-            )
-            prefix_cache_slots = 0
-            prefill_cache_slots = 0
-        if tool_split is not None:
-            print(
-                "  [cfg] target-gpus sharding: disabling tool-split "
-                "(SNAPSHOT_THIN / RESTORE_CHAIN unsupported)",
-                flush=True,
-            )
-            tool_split = None
+        print(
+            "  [cfg] target-gpus sharding: prefix cache + tool-split enabled "
+            "(layer-split SNAPSHOT_THIN / RESTORE_CHAIN)",
+            flush=True,
+        )
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = asyncio.Lock()
 

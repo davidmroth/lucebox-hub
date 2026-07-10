@@ -65,6 +65,16 @@ public:
     virtual void free_drafter() = 0;
 
     virtual bool snapshot_save(int slot) { (void)slot; return false; }
+    virtual bool snapshot_save_thin(int slot, int kv_start, int kv_end) {
+        (void)slot; (void)kv_start; (void)kv_end;
+        return false;
+    }
+    virtual bool snapshot_is_thin(int slot) const { (void)slot; return false; }
+    virtual bool apply_restore_chain(int thick_slot,
+                                     const std::vector<int> & thin_slots) {
+        (void)thick_slot; (void)thin_slots;
+        return false;
+    }
     virtual void snapshot_free(int slot) { (void)slot; }
     virtual bool snapshot_used(int slot) const { (void)slot; return false; }
     virtual int snapshot_cur_pos(int slot) const { (void)slot; return 0; }
@@ -107,6 +117,7 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    bool snapshot_is_thin(int slot) const override;
     SnapshotRef snapshot_ref(int slot) const override;
     bool snapshot_adopt(int slot, ggml_context * ctx,
                         ggml_backend_buffer_t buf, int cur_pos,
@@ -125,6 +136,15 @@ public:
     bool supports_remote_draft() const override;
     bool supports_kvflash() const override;
     bool supports_mixed_backend_layer_split() const override;
+
+    bool try_handle_command(const std::string & line,
+                            const DaemonIO & io) override;
+
+    GenerateResult restore_chain_and_generate_impl(
+            int thick_slot,
+            const std::vector<int> & thin_slots,
+            const GenerateRequest & req,
+            const DaemonIO & io) override;
 
     void shutdown() override;
 

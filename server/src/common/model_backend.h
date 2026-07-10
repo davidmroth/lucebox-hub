@@ -253,6 +253,7 @@ struct ModelBackend {
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;
     virtual int  snapshot_cur_pos(int slot) const = 0;
+    virtual bool snapshot_is_thin(int slot) const { (void)slot; return false; }
 
     // RESTORE <slot> <prompt_path> <n_gen> — restore snapshot + generate.
     // Backend handles the diff-prefill and decode internally.
@@ -274,6 +275,26 @@ struct ModelBackend {
     virtual GenerateResult restore_and_generate_impl(int slot,
                                                      const GenerateRequest & req,
                                                      const DaemonIO & io) = 0;
+
+    // RESTORE_CHAIN <thick> <thin_list> <prompt_path> <n_gen>
+    virtual GenerateResult restore_chain_and_generate_impl(
+            int thick_slot,
+            const std::vector<int> & thin_slots,
+            const GenerateRequest & req,
+            const DaemonIO & io) {
+        (void)thick_slot; (void)thin_slots; (void)req; (void)io;
+        GenerateResult result;
+        result.error = "restore_chain_unsupported";
+        return result;
+    }
+
+    GenerateResult restore_chain_and_generate(
+            int thick_slot,
+            const std::vector<int> & thin_slots,
+            const GenerateRequest & req,
+            const DaemonIO & io) {
+        return restore_chain_and_generate_impl(thick_slot, thin_slots, req, io);
+    }
 
     static bool should_retry_empty_spec_decode(const GenerateRequest & req,
                                                const GenerateResult & result) {

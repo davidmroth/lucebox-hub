@@ -685,6 +685,9 @@ bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
     for (const auto & snap : snaps) {
         if (!snap.ctx) return false;
     }
+    if (snapshot_is_thin(slot)) {
+        return true;
+    }
     if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS ||
         snapshot_prefill_logits_[(size_t)slot].empty()) {
         return false;

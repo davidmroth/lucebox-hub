@@ -183,6 +183,10 @@ int LayerSplitBackend::snapshot_cur_pos(int slot) const {
     return adapter_ ? adapter_->snapshot_cur_pos(slot) : 0;
 }
 
+bool LayerSplitBackend::snapshot_is_thin(int slot) const {
+    return adapter_ && adapter_->snapshot_is_thin(slot);
+}
+
 ModelBackend::SnapshotRef LayerSplitBackend::snapshot_ref(int slot) const {
     return adapter_ ? adapter_->snapshot_ref(slot) : SnapshotRef{};
 }
@@ -216,6 +220,42 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
     delta_req.prompt = std::vector<int32_t>(
         req.prompt.begin() + snap_pos, req.prompt.end());
     return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false);
+}
+
+bool LayerSplitBackend::try_handle_command(const std::string & line,
+                                           const DaemonIO & io) {
+    if (line.rfind("SNAPSHOT_THIN ", 0) == 0) {
+        int slot = -1, kv_start = -1, kv_end = -1;
+        if (std::sscanf(line.c_str() + 14, "%d %d %d",
+                        &slot, &kv_start, &kv_end) != 3
+            || slot < 0 || slot >= ModelBackend::kMaxSlots) {
+            std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
+        } else if (adapter_ &&
+                   adapter_->snapshot_save_thin(slot, kv_start, kv_end)) {
+            std::printf("[snap] thin slot=%d kv=%d,%d\n", slot, kv_start, kv_end);
+            std::fflush(stdout);
+        } else {
+            std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n",
+                         slot, dflash27b_last_error());
+        }
+        io.emit(-1);
+        return true;
+    }
+    return false;
+}
+
+GenerateResult LayerSplitBackend::restore_chain_and_generate_impl(
+        int thick_slot,
+        const std::vector<int> & thin_slots,
+        const GenerateRequest & req,
+        const DaemonIO & io) {
+    GenerateResult result;
+    if (!adapter_ || !adapter_->apply_restore_chain(thick_slot, thin_slots)) {
+        result.error = "restore_chain";
+        io.emit(-1);
+        return result;
+    }
+    return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/false);
 }
 
 ModelBackend::CompressResult

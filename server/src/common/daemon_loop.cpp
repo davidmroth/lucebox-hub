@@ -139,6 +139,46 @@ static bool looks_like_path(const std::string & s) {
     return s.find('/') != std::string::npos;
 }
 
+// Parse "0,1,2" or "-" into thin snapshot slot IDs.
+static bool parse_thin_slot_list(const char * thin_str,
+                                 std::vector<int> & out_ids,
+                                 ModelBackend & backend) {
+    out_ids.clear();
+    if (!thin_str || thin_str[0] == '\0' || std::strcmp(thin_str, "-") == 0) {
+        return true;
+    }
+    const char * p = thin_str;
+    while (*p) {
+        char * end = nullptr;
+        const long id_l = std::strtol(p, &end, 10);
+        if (end == p) {
+            std::fprintf(stderr,
+                "[snap] RESTORE_CHAIN malformed thin list near '%s'\n", p);
+            return false;
+        }
+        const int id = (int)id_l;
+        if (id < 0 || id >= ModelBackend::kMaxSlots ||
+            !backend.snapshot_used(id) || !backend.snapshot_is_thin(id)) {
+            std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thin slot=%d\n", id);
+            return false;
+        }
+        out_ids.push_back(id);
+        if (*end == '\0') break;
+        if (*end != ',') {
+            std::fprintf(stderr,
+                "[snap] RESTORE_CHAIN expected ',' after slot %d, got '%c'\n",
+                id, *end);
+            return false;
+        }
+        p = end + 1;
+        if (*p == '\0' || *p == ',') {
+            std::fprintf(stderr, "[snap] RESTORE_CHAIN empty thin slot entry\n");
+            return false;
+        }
+    }
+    return true;
+}
+
 // Read a prompt file: raw int32 stream (file size implies token count).
 static std::vector<int32_t> read_uncounted_i32(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -252,15 +292,6 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             std::printf("\n"); std::fflush(stdout);
             continue;
         }
-        if (starts_with(line, "SNAPSHOT ")) {
-            int slot = std::atoi(line.c_str() + 9);
-            backend.snapshot_save(slot);
-            std::printf("[snap] inline slot=%d cur_pos=%d\n",
-                        slot,
-                        backend.snapshot_used(slot) ? backend.snapshot_cur_pos(slot) : -1);
-            std::fflush(stdout);
-            continue;
-        }
         if (starts_with(line, "FREE_SNAPSHOT ")) {
             int slot = std::atoi(line.c_str() + 14);
             if (slot >= 0 && slot < ModelBackend::kMaxSlots) {
@@ -271,9 +302,17 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             continue;
         }
 
-        // ── Arch-specific command hook ───────────────────────────────
-        // qwen35 uses this for SNAPSHOT_THIN, RESTORE_CHAIN, etc.
+        // SNAPSHOT_THIN before SNAPSHOT; arch hook before generate commands.
         if (backend.try_handle_command(line, io)) {
+            continue;
+        }
+        if (starts_with(line, "SNAPSHOT ")) {
+            int slot = std::atoi(line.c_str() + 9);
+            backend.snapshot_save(slot);
+            std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                        slot,
+                        backend.snapshot_used(slot) ? backend.snapshot_cur_pos(slot) : -1);
+            std::fflush(stdout);
             continue;
         }
 
@@ -332,6 +371,74 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                         result.prefill_s, result.decode_s,
                         result.tokens.size() / std::max(1e-9, result.decode_s),
                         out_path.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+
+        // ── RESTORE_CHAIN <thick> <thin_list> <prompt_path> <n_gen> ─
+        if (cmd == "RESTORE_CHAIN") {
+            int thick_slot = -2;
+            std::string thin_str;
+            std::string in_path;
+            int n_gen = 0;
+            iss >> thick_slot >> thin_str >> in_path >> n_gen;
+            if (thick_slot < -1 || thick_slot >= ModelBackend::kMaxSlots ||
+                thin_str.empty() || in_path.empty() || n_gen <= 0) {
+                std::fprintf(stderr, "[snap] RESTORE_CHAIN bad args: %s\n",
+                             line.c_str());
+                std::printf("err bad_args\n"); std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
+            if (thick_slot != -1 &&
+                (!backend.snapshot_used(thick_slot) ||
+                 backend.snapshot_is_thin(thick_slot))) {
+                std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thick slot=%d\n",
+                             thick_slot);
+                std::printf("err bad_slot\n"); std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
+            std::vector<int> thin_ids;
+            if (!parse_thin_slot_list(thin_str.c_str(), thin_ids, backend)) {
+                std::printf("err bad_thin_list\n"); std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
+            auto prompt = read_uncounted_i32(in_path);
+            if (prompt.empty()) {
+                std::printf("err empty_prompt\n"); std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
+
+            int snap_pos = -1, snap_slot = -1;
+            parse_inline_snap(line, snap_pos, snap_slot);
+
+            GenerateRequest req;
+            req.prompt    = std::move(prompt);
+            req.n_gen     = n_gen;
+            req.sampler   = sampler;
+            req.do_sample = do_sample;
+            req.stream    = true;
+            req.snap_pos  = snap_pos;
+            req.snap_slot = snap_slot;
+
+            auto result = backend.restore_chain_and_generate(
+                thick_slot, thin_ids, req, io);
+            if (!result.ok) {
+                std::printf("err %s\n", result.error.c_str());
+                std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
+            const int prefix_len = thick_slot >= 0
+                ? backend.snapshot_cur_pos(thick_slot)
+                : (thin_ids.empty() ? 0 : backend.snapshot_cur_pos(thin_ids.front()));
+            std::printf(
+                "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d) stream_fd=%d\n",
+                (int)req.prompt.size(), result.tokens.size(),
+                prefix_len, thick_slot, io.stream_fd);
             std::fflush(stdout);
             continue;
         }
