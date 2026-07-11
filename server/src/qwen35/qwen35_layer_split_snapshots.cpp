@@ -24,6 +24,19 @@ bool Qwen35LayerSplitAdapter::snapshot_save_thin(int slot,
                                                  int kv_end) {
     if (!snapshot_slot_valid(slot)) return false;
     if (snapshot_backends_.size() != shards_.size()) return false;
+    if (kv_end <= kv_start || kv_start < 0) return false;
+    const int cur_pos = shards_.empty() ? 0 : shards_.front().cache.cur_pos;
+    if (kv_end > cur_pos) {
+        set_last_error("snapshot_save_thin: kv_end exceeds cur_pos");
+        return false;
+    }
+    if (kvflash_active() &&
+        (cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity())) {
+        if (!kvflash_sync_identity(kv_end)) {
+            set_last_error("snapshot_save_thin: kvflash identity sync failed");
+            return false;
+        }
+    }
     snapshot_free(slot);
     auto & snaps = prefix_snapshots_[(size_t)slot];
     if (snaps.size() != shards_.size()) snaps.resize(shards_.size());
