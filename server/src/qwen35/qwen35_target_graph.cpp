@@ -1681,7 +1681,7 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
         set_last_error("snapshot_thin: kv_end exceeds cache.cur_pos (would capture uninitialized KV)");
         return false;
     }
-    const int n_full_attn = w.n_layer / w.full_attention_interval;
+    const int n_full_attn = (int)cache.attn_k.size();
     const int block_size  = kv_end - kv_start;
 
     // Lazy alloc; if snap was already a THIN with same range, reuse.
@@ -1702,36 +1702,47 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
         snap.attn_v_snap.assign(n_full_attn, nullptr);
         // SSM/conv/target_feat NOT allocated for thin.
         for (int i = 0; i < n_full_attn; i++) {
-            ggml_tensor * sk = cache.attn_k[i];
-            ggml_tensor * sv = cache.attn_v[i];
+            ggml_tensor * sk = cache.attn_k[(size_t)i];
+            ggml_tensor * sv = cache.attn_v[(size_t)i];
+            if (!sk || !sv) continue;
             // Tightly-packed shape [HEAD_DIM, block_size, N_HEAD_KV]
-            snap.attn_k_snap[i] = ggml_new_tensor_3d(snap.ctx, sk->type,
+            snap.attn_k_snap[(size_t)i] = ggml_new_tensor_3d(snap.ctx, sk->type,
                                                       sk->ne[0], block_size, sk->ne[2]);
-            snap.attn_v_snap[i] = ggml_new_tensor_3d(snap.ctx, sv->type,
+            snap.attn_v_snap[(size_t)i] = ggml_new_tensor_3d(snap.ctx, sv->type,
                                                       sv->ne[0], block_size, sv->ne[2]);
             char name[64];
             std::snprintf(name, sizeof(name), "snap_thin_k_%d", i);
-            ggml_set_name(snap.attn_k_snap[i], name);
+            ggml_set_name(snap.attn_k_snap[(size_t)i], name);
             std::snprintf(name, sizeof(name), "snap_thin_v_%d", i);
-            ggml_set_name(snap.attn_v_snap[i], name);
+            ggml_set_name(snap.attn_v_snap[(size_t)i], name);
         }
-        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
-        if (!snap.buf) {
-            set_last_error("thin snap alloc failed");
-            ggml_free(snap.ctx);
-            snap.ctx = nullptr;
-            snap.attn_k_snap.clear();
-            snap.attn_v_snap.clear();
-            return false;
+        bool any_tensors = false;
+        for (ggml_tensor * t : snap.attn_k_snap) {
+            if (t) { any_tensors = true; break; }
+        }
+        if (any_tensors) {
+            snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
+            if (!snap.buf) {
+                set_last_error("thin snap alloc failed");
+                ggml_free(snap.ctx);
+                snap.ctx = nullptr;
+                snap.attn_k_snap.clear();
+                snap.attn_v_snap.clear();
+                return false;
+            }
+        } else {
+            snap.buf = nullptr;
         }
     }
 
-    // Copy strip-by-strip.
+    // Copy strip-by-strip. Layer-split shards only own a subset of full-attn
+    // layers; nullptr attn_k[i] on non-owning GPUs must be skipped.
     for (int i = 0; i < n_full_attn; i++) {
-        ggml_tensor * sk = cache.attn_k[i];
-        ggml_tensor * sv = cache.attn_v[i];
-        ggml_tensor * dk = snap.attn_k_snap[i];
-        ggml_tensor * dv = snap.attn_v_snap[i];
+        ggml_tensor * sk = cache.attn_k[(size_t)i];
+        ggml_tensor * sv = cache.attn_v[(size_t)i];
+        ggml_tensor * dk = snap.attn_k_snap[(size_t)i];
+        ggml_tensor * dv = snap.attn_v_snap[(size_t)i];
+        if (!sk || !sv || !dk || !dv) continue;
         const size_t k_strip = (size_t)block_size * sk->nb[1];
         const size_t v_strip = (size_t)block_size * sv->nb[1];
         std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
@@ -1782,10 +1793,11 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
         }
         const int block_size = thin->kv_end - thin->kv_start;
         for (int i = 0; i < (int)cache.attn_k.size(); i++) {
-            ggml_tensor * sk = thin->attn_k_snap[i];
-            ggml_tensor * sv = thin->attn_v_snap[i];
-            ggml_tensor * dk = cache.attn_k[i];
-            ggml_tensor * dv = cache.attn_v[i];
+            ggml_tensor * sk = thin->attn_k_snap[(size_t)i];
+            ggml_tensor * sv = thin->attn_v_snap[(size_t)i];
+            ggml_tensor * dk = cache.attn_k[(size_t)i];
+            ggml_tensor * dv = cache.attn_v[(size_t)i];
+            if (!sk || !sv || !dk || !dv) continue;
             const size_t k_strip = (size_t)block_size * dk->nb[1];
             const size_t v_strip = (size_t)block_size * dv->nb[1];
             std::vector<uint8_t> bufk(k_strip), bufv(v_strip);

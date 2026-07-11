@@ -7,10 +7,48 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <utility>
 
 namespace dflash::common {
+
+namespace {
+
+// Tool-prefix inline snaps must register thin slots for RESTORE_CHAIN.
+// Python sets DFLASH_TOOL_SNAP_SLOT_BASE to match ToolSlotCache.slot_base.
+static int tool_snap_slot_base() {
+    const char * env = std::getenv("DFLASH_TOOL_SNAP_SLOT_BASE");
+    if (env && *env) return std::max(0, std::atoi(env));
+    const char * prefix = std::getenv("DFLASH_PREFIX_CACHE_SLOTS");
+    int base = prefix && *prefix ? std::atoi(prefix) : 2;
+    const char * prefill = std::getenv("DFLASH_PREFILL_CACHE_SLOTS");
+    if (prefill && *prefill) base += std::atoi(prefill);
+    return std::max(0, base);
+}
+
+static bool inline_snap_uses_thin(int snap_slot) {
+    return snap_slot >= tool_snap_slot_base();
+}
+
+static bool save_inline_snapshot(LayerSplitAdapter * adapter,
+                                 int snap_slot,
+                                 int snap_pos) {
+    if (!adapter) return false;
+    if (inline_snap_uses_thin(snap_slot)) {
+        if (!adapter->snapshot_save_thin(snap_slot, 0, snap_pos)) return false;
+        std::printf("[snap] inline slot=%d cur_pos=%d thin=1\n",
+                    snap_slot, snap_pos);
+        std::fflush(stdout);
+        return true;
+    }
+    if (!adapter->snapshot_save(snap_slot)) return false;
+    std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, snap_pos);
+    std::fflush(stdout);
+    return true;
+}
+
+}  // namespace
 
 LayerSplitBackend::LayerSplitBackend(std::unique_ptr<LayerSplitAdapter> adapter)
     : adapter_(std::move(adapter)) {}
@@ -92,10 +130,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
             return result;
         }
         if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
-            adapter_->snapshot_save(req.snap_slot)) {
-            std::printf("[snap] inline slot=%d cur_pos=%d\n",
-                        req.snap_slot, req.snap_pos);
-            std::fflush(stdout);
+            save_inline_snapshot(adapter_.get(), req.snap_slot, req.snap_pos)) {
         }
     } else {
         const int prompt_len = (int)req.prompt.size();
@@ -120,11 +155,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
             consumed += n_tokens;
             if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
                 base_pos + consumed == req.snap_pos) {
-                if (adapter_->snapshot_save(req.snap_slot)) {
-                    std::printf("[snap] inline slot=%d cur_pos=%d\n",
-                                req.snap_slot, req.snap_pos);
-                    std::fflush(stdout);
-                }
+                save_inline_snapshot(adapter_.get(), req.snap_slot, req.snap_pos);
             }
         }
     }
