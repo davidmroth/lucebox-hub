@@ -110,6 +110,8 @@ public:
     bool unpark(const std::string & what) override;
     bool is_target_parked() const override { return false; }
 
+    bool supports_multimodal() const override;
+
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
 
