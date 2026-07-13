@@ -291,7 +291,21 @@ GenerateResult LayerSplitBackend::restore_chain_and_generate_impl(
         io.emit(-1);
         return result;
     }
-    return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/false);
+    const int snap_pos = adapter_->current_cur_pos();
+    // RESTORE_CHAIN may be invoked with either the full conversation history
+    // (chat turn) or a tail-only payload (deferred conv snap).
+    // - Full prompt (req.prompt.size() > snap_pos): truncate to the suffix so
+    //   we only prefill the tokens not yet in the KV cache.
+    // - Tail-only payload (req.prompt.size() <= snap_pos): the caller already
+    //   sliced the suffix; pass it as-is.
+    // Either way base_pos=snap_pos so the engine writes at the correct offset.
+    if ((int)req.prompt.size() > snap_pos) {
+        GenerateRequest delta_req = req;
+        delta_req.prompt = std::vector<int32_t>(
+            req.prompt.begin() + snap_pos, req.prompt.end());
+        return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false);
+    }
+    return run_from_state(req, io, snap_pos, /*reset_state=*/false);
 }
 
 ModelBackend::CompressResult

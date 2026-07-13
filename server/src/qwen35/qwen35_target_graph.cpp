@@ -1779,7 +1779,9 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
         if (!restore_target_cache(*thick, cache)) return false;
     }
     // Step 2: layer thins into KV cache at their respective ranges.
-    int max_kv_end = cache.cur_pos;
+    // If no thick base is provided, start from 0 so the thin snap boundary
+    // is used as cur_pos rather than the stale pre-restore position.
+    int max_kv_end = thick ? thick->cur_pos : 0;
     for (int t = 0; t < n_thins; t++) {
         const PrefixSnapshot * thin = thins[t];
         if (!thin->is_thin) {
