@@ -195,6 +195,11 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
+    // Wall time for RESTORE_CHAIN apply (H2D thick+thin) before suffix prefill.
+    // 0 when not a restore-chain request.
+    double                     restore_s   = 0.0;
+    // Tokens prefilling after restore (suffix). -1 when unknown / full prefill.
+    int                        suffix_n    = -1;
     // True when the backend's Level 2 hook injected the </think> close
     // sequence during this generation (vs. the model self-closing). The
     // server uses this to attribute close_kind correctly: if the model

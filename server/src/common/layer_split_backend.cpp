@@ -286,11 +286,14 @@ GenerateResult LayerSplitBackend::restore_chain_and_generate_impl(
         const GenerateRequest & req,
         const DaemonIO & io) {
     GenerateResult result;
+    auto t_restore_start = std::chrono::steady_clock::now();
     if (!adapter_ || !adapter_->apply_restore_chain(thick_slot, thin_slots)) {
         result.error = "restore_chain";
         io.emit(-1);
         return result;
     }
+    result.restore_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_restore_start).count();
     const int snap_pos = adapter_->current_cur_pos();
     // RESTORE_CHAIN may be invoked with either the full conversation history
     // (chat turn) or a tail-only payload (deferred conv snap).
@@ -303,9 +306,39 @@ GenerateResult LayerSplitBackend::restore_chain_and_generate_impl(
         GenerateRequest delta_req = req;
         delta_req.prompt = std::vector<int32_t>(
             req.prompt.begin() + snap_pos, req.prompt.end());
-        return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false);
+        result.suffix_n = (int)delta_req.prompt.size();
+        GenerateResult gen = run_from_state(
+            delta_req, io, snap_pos, /*reset_state=*/false);
+        gen.restore_s = result.restore_s;
+        gen.suffix_n = result.suffix_n;
+        std::fprintf(stderr,
+            "[restore-chain] thick=%d thin_n=%zu snap_pos=%d restore_s=%.3f "
+            "suffix_n=%d prefill_s=%.3f decode_s=%.3f\n",
+            thick_slot, thin_slots.size(), snap_pos, gen.restore_s,
+            gen.suffix_n, gen.prefill_s, gen.decode_s);
+        if (gen.ok && gen.suffix_n > 0) {
+            // Feeds DaemonStdoutBus → usage.timings.prefill_ms (suffix only).
+            std::printf("[prefill] layer-seg %d tokens in %.3f s\n",
+                        gen.suffix_n, gen.prefill_s);
+            std::fflush(stdout);
+        }
+        return gen;
     }
-    return run_from_state(req, io, snap_pos, /*reset_state=*/false);
+    result.suffix_n = (int)req.prompt.size();
+    GenerateResult gen = run_from_state(req, io, snap_pos, /*reset_state=*/false);
+    gen.restore_s = result.restore_s;
+    gen.suffix_n = result.suffix_n;
+    std::fprintf(stderr,
+        "[restore-chain] thick=%d thin_n=%zu snap_pos=%d restore_s=%.3f "
+        "suffix_n=%d prefill_s=%.3f decode_s=%.3f\n",
+        thick_slot, thin_slots.size(), snap_pos, gen.restore_s,
+        gen.suffix_n, gen.prefill_s, gen.decode_s);
+    if (gen.ok && gen.suffix_n > 0) {
+        std::printf("[prefill] layer-seg %d tokens in %.3f s\n",
+                    gen.suffix_n, gen.prefill_s);
+        std::fflush(stdout);
+    }
+    return gen;
 }
 
 ModelBackend::CompressResult

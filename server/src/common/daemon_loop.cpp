@@ -740,9 +740,15 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 ? backend.snapshot_cur_pos(thick_slot)
                 : (thin_ids.empty() ? 0 : backend.snapshot_cur_pos(thin_ids.front()));
             std::printf(
-                "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d) stream_fd=%d\n",
+                "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d) "
+                "restore_s=%.3f prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f "
+                "suffix_n=%d stream_fd=%d\n",
                 (int)req.prompt.size(), result.tokens.size(),
-                prefix_len, thick_slot, io.stream_fd);
+                prefix_len, thick_slot,
+                result.restore_s, result.prefill_s, result.decode_s,
+                result.tokens.size() / std::max(1e-9, result.decode_s),
+                result.suffix_n,
+                io.stream_fd);
             std::fflush(stdout);
             continue;
         }
