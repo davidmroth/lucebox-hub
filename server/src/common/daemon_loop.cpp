@@ -548,7 +548,10 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
         if (line == "SCHED_DRAIN") {
             if (!require_stream_tagged("SCHED_DRAIN")) continue;
             int steps = 0;
-            while (true) {
+            // Bound empty-continue spins: a zero-token CONTINUE must not
+            // monopolize stdin (gen_len=0 / stalled continue_generate).
+            int zero_token_streak = 0;
+            while (steps < 65536) {
                 if (pending_quanta.empty()) {
                     if (!enqueue_next_quantum(requests, pending_quanta, scheduler_cursor)) {
                         break;
@@ -556,8 +559,33 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 }
                 PendingQuantum q = pending_quanta.front();
                 pending_quanta.pop_front();
-                run_one_quantum(q);
+                LiveRequestState & before = requests[(size_t)std::max(0, q.slot_id)];
+                const int rem_before = before.remaining;
+                const bool ran = run_one_quantum(q);
                 ++steps;
+                if (ran) {
+                    LiveRequestState & after = requests[(size_t)std::max(0, q.slot_id)];
+                    if (after.active && after.remaining == rem_before) {
+                        ++zero_token_streak;
+                        if (zero_token_streak >= 8) {
+                            std::fprintf(stderr,
+                                "[scheduler] SCHED_DRAIN abort: zero-token streak "
+                                "slot=%d remaining=%d\n",
+                                q.slot_id, after.remaining);
+                            after.active = false;
+                            after.remaining = 0;
+                            backend.set_target_cache_slot_busy(q.slot_id, false);
+                            current_req_id = after.request_id;
+                            sync_io_ids();
+                            io.emit_done();
+                            zero_token_streak = 0;
+                        }
+                    } else {
+                        zero_token_streak = 0;
+                    }
+                } else {
+                    zero_token_streak = 0;
+                }
                 enqueue_next_quantum(requests, pending_quanta, scheduler_cursor);
             }
             std::printf("ok SCHED_DRAIN steps=%d\n", steps);
