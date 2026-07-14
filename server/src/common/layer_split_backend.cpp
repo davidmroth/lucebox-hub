@@ -322,6 +322,19 @@ GenerateResult LayerSplitBackend::restore_chain_and_generate_impl(
                         gen.suffix_n, gen.prefill_s);
             std::fflush(stdout);
         }
+        // Ack before any further work / return-path teardown so the stdin
+        // protocol client never sits behind a hung post-restore cleanup.
+        std::printf(
+            "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d) "
+            "restore_s=%.3f prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f "
+            "suffix_n=%d stream_fd=%d\n",
+            (int)req.prompt.size(), gen.tokens.size(),
+            snap_pos, thick_slot,
+            gen.restore_s, gen.prefill_s, gen.decode_s,
+            gen.tokens.size() / std::max(1e-9, gen.decode_s),
+            gen.suffix_n,
+            io.stream_fd);
+        std::fflush(stdout);
         return gen;
     }
     result.suffix_n = (int)req.prompt.size();
@@ -338,6 +351,17 @@ GenerateResult LayerSplitBackend::restore_chain_and_generate_impl(
                     gen.suffix_n, gen.prefill_s);
         std::fflush(stdout);
     }
+    std::printf(
+        "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d) "
+        "restore_s=%.3f prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f "
+        "suffix_n=%d stream_fd=%d\n",
+        (int)req.prompt.size(), gen.tokens.size(),
+        snap_pos, thick_slot,
+        gen.restore_s, gen.prefill_s, gen.decode_s,
+        gen.tokens.size() / std::max(1e-9, gen.decode_s),
+        gen.suffix_n,
+        io.stream_fd);
+    std::fflush(stdout);
     return gen;
 }
 
