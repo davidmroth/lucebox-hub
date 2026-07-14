@@ -14,34 +14,48 @@ bool run_layer_split_ar_decode(
         const LayerSplitForwardStep & forward_one,
         const std::function<bool(int)> & is_eos,
         std::vector<int32_t> & out_tokens,
-        const DaemonIO & io) {
+        const DaemonIO & io,
+        bool seed_already_streamed) {
     if (n_gen <= 0) return true;
 
     std::vector<int32_t> history;
     if (sampler.needs_logit_processing()) {
-        history.reserve(history_prefix.size() + out_tokens.size() + (size_t)n_gen);
+        history.reserve(history_prefix.size() + out_tokens.size() +
+                        (size_t)n_gen + 1);
         history.insert(history.end(), history_prefix.begin(), history_prefix.end());
         history.insert(history.end(), out_tokens.begin(), out_tokens.end());
-        if ((int)prefill_last_logits.size() != vocab) return false;
-        last_tok = sample_logits(prefill_last_logits.data(), vocab, sampler,
-                                 history, rng);
+        if (seed_already_streamed) {
+            history.push_back(last_tok);
+        }
     }
-
-    out_tokens.push_back(last_tok);
-    if (sampler.needs_logit_processing()) history.push_back(last_tok);
-    io.emit(last_tok);
-    if (io.cancelled) {
-        io.emit(-1);
-        return true;
-    }
-    if (is_eos(last_tok)) {
-        io.emit(-1);
-        return true;
-    }
-    ++committed;
-
     std::vector<float> logits_buf;
-    for (int i = 1; i < n_gen; ++i) {
+
+    if (!seed_already_streamed) {
+        // Fresh decode after prefill: first token comes from prefill logits
+        // (when sampling) or the seed argmax, then is streamed.
+        if (sampler.needs_logit_processing()) {
+            if ((int)prefill_last_logits.size() != vocab) return false;
+            last_tok = sample_logits(prefill_last_logits.data(), vocab, sampler,
+                                     history, rng);
+        }
+
+        out_tokens.push_back(last_tok);
+        if (sampler.needs_logit_processing()) history.push_back(last_tok);
+        io.emit(last_tok);
+        if (io.cancelled) {
+            io.emit(-1);
+            return true;
+        }
+        if (is_eos(last_tok)) {
+            io.emit(-1);
+            return true;
+        }
+        ++committed;
+        // Remaining budget after the seed emission.
+        --n_gen;
+    }
+
+    for (int i = 0; i < n_gen; ++i) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
         logits_buf.clear();
@@ -66,8 +80,6 @@ bool run_layer_split_ar_decode(
 
     // Quantum budget exhaustion is NOT stream termination. Multi-request SCHED
     // emits CONTINUE/DONE from finalize_live_quantum / RESTORE_CHAIN admit.
-    // Emitting DONE here after each AR quantum made demux stop after roughly
-    // Q1(dflash, no trailing DONE) + Q2(AR, DONE) ≈ 16 tokens in WebUI.
     if (io.cancelled || is_eos(last_tok)) {
         io.emit(-1);
     }

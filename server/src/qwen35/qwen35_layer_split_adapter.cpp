@@ -1305,7 +1305,8 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         int last_tok, int committed, int n_gen,
         const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
-        const DaemonIO & io) {
+        const DaemonIO & io,
+        bool seed_already_streamed) {
     if (n_gen <= 0) return true;
     const auto & w = shards_.front().weights;
     const int vocab = w.n_vocab;
@@ -1336,7 +1337,7 @@ bool Qwen35LayerSplitAdapter::decode_ar(
                 kvflash_active() ? &kvflash_pager_ : nullptr);
         },
         [&](int tok) { return is_eos_tok(tok, w); },
-        out_tokens, io);
+        out_tokens, io, seed_already_streamed);
     if (ok && kvflash_active()) {
         kvflash_sync_history(out_tokens, committed);
         kvflash_maybe_reselect((int)out_tokens.size());
