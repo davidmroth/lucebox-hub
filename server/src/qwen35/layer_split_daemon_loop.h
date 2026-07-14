@@ -38,6 +38,10 @@ struct LayerSplitDaemonConfig {
     int kq_stride_pad   = 32;
     int fa_window        = 0;
     int draft_ctx_max    = 2048;
+
+    // Phase 2: multi live target-cache slots + tagged stream demux.
+    int  target_cache_slots = 1;
+    bool stream_tagged      = false;
 };
 
 // Run the layer-split daemon event loop. Returns exit code (0 = success).

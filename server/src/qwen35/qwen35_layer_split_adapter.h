@@ -49,6 +49,9 @@ struct Qwen35LayerSplitAdapterConfig {
     const char * mmproj_path = nullptr;
     bool mmproj_use_gpu = true;
     int mmproj_threads = 4;
+
+    // Phase 2: number of live target-cache slots (default 1 = legacy).
+    int target_cache_slots = 1;
 };
 
 class Qwen35LayerSplitAdapter : public LayerSplitAdapter {
