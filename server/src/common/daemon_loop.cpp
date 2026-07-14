@@ -277,6 +277,10 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
     size_t scheduler_cursor = 0;
     int current_req_id = 0;
     int current_slot = backend.active_target_cache_slot();
+    // True when the current stdin line carried an explicit "SLOT k" prefix.
+    // Multi-slot RESTORE_CHAIN / SNAPSHOT_THIN require this so restore cannot
+    // silently hit whichever live cache SCHED_DRAIN left active.
+    bool saw_slot_prefix = false;
 
     auto sync_io_ids = [&]() {
         io.request_id = current_req_id;
@@ -287,6 +291,17 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
         if (args.stream_tagged) return true;
         std::fprintf(stderr, "[scheduler] %s requires --stream-tagged\n", label);
         std::printf("err stream_tagged_required\n");
+        std::fflush(stdout);
+        return false;
+    };
+
+    auto require_slot_prefix = [&](const char * label) -> bool {
+        if (n_slots <= 1 || saw_slot_prefix) return true;
+        std::fprintf(stderr,
+            "[scheduler] %s requires SLOT <id> when target_cache_slots=%d "
+            "(active=%d)\n",
+            label, n_slots, backend.active_target_cache_slot());
+        std::printf("err slot_required\n");
         std::fflush(stdout);
         return false;
     };
@@ -322,6 +337,7 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                     return false;
                 }
                 current_slot = sid;
+                saw_slot_prefix = true;
                 continue;
             }
             break;
@@ -368,6 +384,7 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
     while (std::getline(std::cin, line)) {
         if (line == "quit" || line == "exit") break;
 
+        saw_slot_prefix = false;
         if (!parse_req_slot_prefix(line)) continue;
         if (line.empty()) continue;
 
@@ -599,15 +616,26 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
         }
 
         // SNAPSHOT_THIN before SNAPSHOT; arch hook before generate commands.
+        // Tool pins copy from the *active* live TargetCache — when N>1 the
+        // caller must name which live slot via "SLOT k SNAPSHOT_THIN …".
+        if (starts_with(line, "SNAPSHOT_THIN ") &&
+            !require_slot_prefix("SNAPSHOT_THIN")) {
+            io.emit(-1);
+            continue;
+        }
         if (backend.try_handle_command(line, io)) {
             continue;
         }
         if (starts_with(line, "SNAPSHOT ")) {
+            if (!require_slot_prefix("SNAPSHOT")) {
+                continue;
+            }
             int slot = std::atoi(line.c_str() + 9);
             backend.snapshot_save(slot);
-            std::printf("[snap] inline slot=%d cur_pos=%d\n",
+            std::printf("[snap] inline slot=%d cur_pos=%d live=%d\n",
                         slot,
-                        backend.snapshot_used(slot) ? backend.snapshot_cur_pos(slot) : -1);
+                        backend.snapshot_used(slot) ? backend.snapshot_cur_pos(slot) : -1,
+                        backend.active_target_cache_slot());
             std::fflush(stdout);
             continue;
         }
@@ -673,9 +701,17 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
 
         // ── RESTORE_CHAIN <thick> <thin_list> <prompt_path> <n_gen> ─
         if (cmd == "RESTORE_CHAIN") {
-            if (backend.target_cache_slot_busy(backend.active_target_cache_slot())) {
+            // Require SLOT when N>1 *before* busy — bare RESTORE_CHAIN must not
+            // hit the wrong live cache. Busy check then uses that activated slot.
+            if (!require_slot_prefix("RESTORE_CHAIN")) {
+                io.emit(-1);
+                continue;
+            }
+            const int restore_live_slot = backend.active_target_cache_slot();
+            if (backend.target_cache_slot_busy(restore_live_slot)) {
                 std::fprintf(stderr,
-                    "[scheduler] RESTORE_CHAIN refused: active slot busy\n");
+                    "[scheduler] RESTORE_CHAIN refused: slot %d busy\n",
+                    restore_live_slot);
                 std::printf("err slot_busy\n");
                 std::fflush(stdout);
                 io.emit(-1);
@@ -740,11 +776,11 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 ? backend.snapshot_cur_pos(thick_slot)
                 : (thin_ids.empty() ? 0 : backend.snapshot_cur_pos(thin_ids.front()));
             std::printf(
-                "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d) "
+                "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d live=%d) "
                 "restore_s=%.3f prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f "
                 "suffix_n=%d stream_fd=%d\n",
                 (int)req.prompt.size(), result.tokens.size(),
-                prefix_len, thick_slot,
+                prefix_len, thick_slot, restore_live_slot,
                 result.restore_s, result.prefill_s, result.decode_s,
                 result.tokens.size() / std::max(1e-9, result.decode_s),
                 result.suffix_n,
