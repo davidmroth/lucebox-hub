@@ -60,7 +60,8 @@ public:
                  int base_pos, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
-                   const DaemonIO & io) override;
+                   const DaemonIO & io,
+                 bool seed_already_streamed = false) override;
     bool supports_cpu_sampling() const override { return true; }
     bool supports_kvflash() const override { return kvflash_active(); }
     bool supports_mixed_backend_layer_split() const override {

@@ -491,8 +491,11 @@ GenerateResult LayerSplitBackend::continue_generate(int n_gen, const DaemonIO & 
         return result;
     }
     auto t0 = std::chrono::steady_clock::now();
+    // Seed token was already streamed in the prior quantum — do not re-emit it
+    // or WebUI shows duplicated words at every SCHED quantum boundary.
     const bool ok = adapter_->decode_ar(last_tok, committed, n_gen,
-                                        result.tokens, io);
+                                        result.tokens, io,
+                                        /*seed_already_streamed=*/true);
     result.decode_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
     result.ok = ok;

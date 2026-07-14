@@ -1041,7 +1041,8 @@ bool Gemma4LayerSplitAdapter::decode_ar(
         int committed,
         int n_gen,
         std::vector<int32_t> & out_tokens,
-        const DaemonIO & io) {
+        const DaemonIO & io,
+        bool seed_already_streamed) {
     if (n_gen <= 0) return true;
     if (shards_.empty()) return false;
 
@@ -1057,7 +1058,7 @@ bool Gemma4LayerSplitAdapter::decode_ar(
                 : run_forward(one, pos - 1, next_tok, logits_out);
         },
         [&](int tok) { return tok == w.eos_id || tok == w.eos_chat_id; },
-        out_tokens, io);
+        out_tokens, io, seed_already_streamed);
     if (ok && kvflash_active()) {
         kvflash_sync_history(out_tokens, committed);
         kvflash_maybe_reselect((int)out_tokens.size());

@@ -36,7 +36,8 @@ public:
     }
     virtual bool decode_ar(int last_tok, int committed, int n_gen,
                            std::vector<int32_t> & out_tokens,
-                           const DaemonIO & io) = 0;
+                           const DaemonIO & io,
+                           bool seed_already_streamed = false) = 0;
     virtual bool supports_cpu_sampling() const { return false; }
 
     virtual bool can_dflash_decode() const { return false; }
