@@ -14,9 +14,10 @@
 namespace dflash::common {
 
 struct DaemonLoopArgs {
-    int stream_fd = -1;
-    int chunk     = 2048;    // chunked-prefill chunk size (forwarded to backend)
-    int max_ctx   = 16384;   // max context (forwarded to backend for overflow check)
+    int  stream_fd = -1;
+    int  chunk     = 2048;    // chunked-prefill chunk size (forwarded to backend)
+    int  max_ctx   = 16384;   // max context (forwarded to backend for overflow check)
+    bool stream_tagged = false;  // Phase 1: demux frames [-2, req_id, tok]
 };
 
 // Boots the model (via backend.print_ready_banner()), and services stdin

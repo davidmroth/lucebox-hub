@@ -30,6 +30,7 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     cfg.ddtree_temp        = args.ddtree_temp;
     cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
     cfg.use_feature_mirror = args.use_feature_mirror;
+    cfg.target_cache_slots = args.target_cache_slots;
 
     Qwen35Backend backend(cfg);
     if (!backend.init()) return 1;
@@ -38,6 +39,7 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     dargs.stream_fd = args.stream_fd;
     dargs.chunk     = args.chunk;
     dargs.max_ctx   = args.device.max_ctx;
+    dargs.stream_tagged = args.stream_tagged;
 
     return run_daemon(backend, dargs);
 }
