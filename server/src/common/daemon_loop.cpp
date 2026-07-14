@@ -772,20 +772,27 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 io.emit(-1);
                 continue;
             }
-            const int prefix_len = thick_slot >= 0
-                ? backend.snapshot_cur_pos(thick_slot)
-                : (thin_ids.empty() ? 0 : backend.snapshot_cur_pos(thin_ids.front()));
+            // Print the success ack before any snapshot bookkeeping so a
+            // stuck cur_pos query cannot leave the client hanging after
+            // "[prefill] layer-seg …" (seen on M2b side-binary smoke).
             std::printf(
                 "ok N=%d gen=%zu prefix_len=%d (RESTORE_CHAIN thick=%d live=%d) "
                 "restore_s=%.3f prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f "
                 "suffix_n=%d stream_fd=%d\n",
                 (int)req.prompt.size(), result.tokens.size(),
-                prefix_len, thick_slot, restore_live_slot,
+                /*prefix_len=*/-1, thick_slot, restore_live_slot,
                 result.restore_s, result.prefill_s, result.decode_s,
                 result.tokens.size() / std::max(1e-9, result.decode_s),
                 result.suffix_n,
                 io.stream_fd);
             std::fflush(stdout);
+            const int prefix_len = thick_slot >= 0
+                ? backend.snapshot_cur_pos(thick_slot)
+                : (thin_ids.empty() ? 0 : backend.snapshot_cur_pos(thin_ids.front()));
+            if (prefix_len >= 0) {
+                std::printf("[snap] RESTORE_CHAIN prefix_len=%d\n", prefix_len);
+                std::fflush(stdout);
+            }
             continue;
         }
 
