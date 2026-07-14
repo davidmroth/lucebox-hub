@@ -699,7 +699,11 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             continue;
         }
 
-        // ── RESTORE_CHAIN <thick> <thin_list> <prompt_path> <n_gen> ─
+        // ── RESTORE_CHAIN <thick> <thin_list> <prompt_path> <n_gen> [quantum] ─
+        // Optional trailing <quantum>: when present with --stream-tagged, restore
+        // + first quantum only, then register the live slot for CONTINUE /
+        // SCHED_* (warm multi-request path). Omitting quantum keeps the legacy
+        // blocking full generate.
         if (cmd == "RESTORE_CHAIN") {
             // Require SLOT when N>1 *before* busy — bare RESTORE_CHAIN must not
             // hit the wrong live cache. Busy check then uses that activated slot.
@@ -721,12 +725,23 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             std::string thin_str;
             std::string in_path;
             int n_gen = 0;
+            int quantum = 0;
             iss >> thick_slot >> thin_str >> in_path >> n_gen;
+            if (!(iss >> quantum)) {
+                quantum = 0;
+            }
             if (thick_slot < -1 || thick_slot >= ModelBackend::kMaxSlots ||
-                thin_str.empty() || in_path.empty() || n_gen <= 0) {
+                thin_str.empty() || in_path.empty() || n_gen <= 0 ||
+                quantum < 0) {
                 std::fprintf(stderr, "[snap] RESTORE_CHAIN bad args: %s\n",
                              line.c_str());
                 std::printf("err bad_args\n"); std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
+            if (quantum > 0 && !args.stream_tagged) {
+                std::printf("err stream_tagged_required\n");
+                std::fflush(stdout);
                 io.emit(-1);
                 continue;
             }
@@ -755,15 +770,19 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             int snap_pos = -1, snap_slot = -1;
             parse_inline_snap(line, snap_pos, snap_slot);
 
+            const bool admit = quantum > 0;
+            const int first_gen = admit ? std::min(quantum, n_gen) : n_gen;
+
             GenerateRequest req;
             req.prompt    = std::move(prompt);
-            req.n_gen     = n_gen;
+            req.n_gen     = first_gen;
             req.sampler   = sampler;
             req.do_sample = do_sample;
             req.stream    = true;
             req.snap_pos  = snap_pos;
             req.snap_slot = snap_slot;
 
+            sync_io_ids();
             auto result = backend.restore_chain_and_generate(
                 thick_slot, thin_ids, req, io);
             if (!result.ok) {
@@ -775,8 +794,39 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             // Success ack is printed inside LayerSplitBackend::restore_chain_and_generate_impl
             // immediately after the [prefill] line so the protocol cannot hang
             // behind post-restore teardown.
-            (void)restore_live_slot;
-            (void)result;
+
+            if (admit) {
+                if (restore_live_slot < 0 || restore_live_slot >= n_slots) {
+                    std::printf("err bad_slot\n");
+                    std::fflush(stdout);
+                    io.emit(-1);
+                    continue;
+                }
+                LiveRequestState & lreq = requests[(size_t)restore_live_slot];
+                lreq.active = true;
+                lreq.request_id = current_req_id;
+                lreq.slot_id = restore_live_slot;
+                lreq.quantum = quantum;
+                lreq.emitted = (int)result.tokens.size();
+                lreq.remaining = std::max(0, n_gen - lreq.emitted);
+                lreq.epoch += 1;
+                current_slot = restore_live_slot;
+                backend.set_target_cache_slot_busy(restore_live_slot, true);
+                if (!result.ok || lreq.remaining <= 0 || io.cancelled) {
+                    lreq.active = false;
+                    lreq.remaining = 0;
+                    backend.set_target_cache_slot_busy(restore_live_slot, false);
+                    io.emit_done();
+                } else {
+                    io.emit_continue();
+                }
+                std::printf(
+                    "ok RESTORE_CHAIN_ADMIT req=%d slot=%d emitted=%d remaining=%d "
+                    "total_gen=%d quantum=%d\n",
+                    current_req_id, restore_live_slot, lreq.emitted, lreq.remaining,
+                    n_gen, quantum);
+                std::fflush(stdout);
+            }
             continue;
         }
 
