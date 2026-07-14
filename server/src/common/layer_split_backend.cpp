@@ -469,33 +469,44 @@ void LayerSplitBackend::set_target_cache_slot_busy(int slot_id, bool busy) {
     if (adapter_) adapter_->set_target_cache_slot_busy(slot_id, busy);
 }
 
+bool LayerSplitBackend::token_is_eos(int tok) const {
+    return adapter_ && adapter_->token_is_eos(tok);
+}
+
 GenerateResult LayerSplitBackend::continue_generate(int n_gen, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_) {
-        result.error = "adapter";
+        result.fail(GenerateErrorCode::AdapterUnavailable);
         return result;
     }
     if (n_gen <= 0) {
-        result.ok = true;
+        result.succeed();
         return result;
     }
     const int committed = adapter_->current_cur_pos();
     if (committed <= 0) {
-        result.error = "continue_empty_kv";
+        result.fail(GenerateErrorCode::DecodeSeedMissing, "continue_empty_kv");
         return result;
     }
     const int last_tok = adapter_->current_last_token();
     if (last_tok < 0) {
-        result.error = "decode_seed";
+        result.fail(GenerateErrorCode::DecodeSeedMissing);
+        return result;
+    }
+    // Already finished: do not re-emit the EOS seed as a "new" token (that
+    // made SCHED_DRAIN burn remaining one EOS echo per step).
+    if (adapter_->token_is_eos(last_tok)) {
+        result.succeed();
         return result;
     }
     auto t0 = std::chrono::steady_clock::now();
     const bool ok = adapter_->decode_ar(last_tok, committed, n_gen,
+                                        {},
                                         result.tokens, io);
     result.decode_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
-    result.ok = ok;
-    if (!ok) result.error = "decode";
+    if (ok) result.succeed();
+    else result.fail(GenerateErrorCode::DecodeFailed);
     return result;
 }
 
