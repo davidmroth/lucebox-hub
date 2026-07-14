@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 
 namespace dflash::common {
 
@@ -131,6 +133,8 @@ bool Qwen35LayerSplitAdapter::init() {
     if (kvflash_active()) {
         kvflash_history_snapshots_.resize(PREFIX_SLOTS);
     }
+
+    if (!allocate_extra_live_slots()) return false;
 
     return true;
 }
@@ -432,6 +436,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
     if (kvflash_active()) {
         kvflash_history_snapshots_.resize(PREFIX_SLOTS);
     }
+    if (!allocate_extra_live_slots()) return false;
     return true;
 }
 
@@ -1431,6 +1436,131 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
     return dflash_target_.get();
 }
 
+void Qwen35LayerSplitAdapter::free_extra_live_slots() {
+    for (auto & slot : extra_slots_) {
+        if (!slot) continue;
+        const size_t n = std::max(slot->caches.size(), slot->layer_graphs.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (i < slot->layer_graphs.size()) {
+                step_graph_destroy(slot->layer_graphs[i]);
+            }
+            if (i < slot->caches.size()) {
+                free_target_cache(slot->caches[i]);
+            }
+        }
+        draft_feature_mirror_free(slot->feature_ring);
+    }
+    extra_slots_.clear();
+}
+
+bool Qwen35LayerSplitAdapter::allocate_extra_live_slots() {
+    target_cache_slots_ = std::max(1, std::min(cfg_.target_cache_slots, 16));
+    active_slot_ = 0;
+    slot_busy_.assign((size_t)target_cache_slots_, 0);
+    if (target_cache_slots_ <= 1) return true;
+
+    if (kvflash_active()) {
+        std::fprintf(stderr,
+            "[target-split] --target-cache-slots=%d incompatible with kvflash "
+            "(pager reattach not implemented); unset DFLASH_KVFLASH for multi-slot\n",
+            target_cache_slots_);
+        return false;
+    }
+    if (use_mixed_target_split()) {
+        std::fprintf(stderr,
+            "[target-split] --target-cache-slots=%d not supported with remote "
+            "target shard yet\n",
+            target_cache_slots_);
+        return false;
+    }
+    if (shards_.empty()) {
+        std::fprintf(stderr, "[target-split] no shards for multi-slot caches\n");
+        return false;
+    }
+
+    extra_slots_.reserve((size_t)target_cache_slots_ - 1);
+    for (int sid = 1; sid < target_cache_slots_; ++sid) {
+        auto slot = std::make_unique<LiveSlotState>();
+        slot->caches.resize(shards_.size());
+        slot->layer_graphs.resize(shards_.size());
+        for (size_t i = 0; i < shards_.size(); ++i) {
+            auto & shard = shards_[i];
+            if (!create_target_cache_partial(
+                    shard.weights, cfg_.device.max_ctx, cfg_.max_verify_tokens,
+                    shard.backend, slot->caches[i],
+                    /*prefill_only=*/!cfg_.run_dflash,
+                    shard.layer_begin, shard.layer_end,
+                    /*allocate_target_feat=*/false,
+                    /*ctx_alloc=*/0)) {
+                std::fprintf(stderr,
+                    "[target-split] cache slot %d gpu=%d: %s\n",
+                    sid, shard.gpu, dflash27b_last_error());
+                free_extra_live_slots();
+                return false;
+            }
+        }
+        if (feature_ring_.cap > 0 && draft_backend_) {
+            if (!draft_feature_mirror_init(
+                    slot->feature_ring, draft_backend_,
+                    cfg_.draft_gpu, cfg_.draft_gpu, feature_ring_.cap,
+                    draft_weights_.n_target_layers, draft_weights_.n_embd)) {
+                std::fprintf(stderr,
+                    "[target-split] feature ring for cache slot %d failed\n",
+                    sid);
+                free_extra_live_slots();
+                return false;
+            }
+        }
+        extra_slots_.push_back(std::move(slot));
+    }
+    std::printf(
+        "[daemon] target_cache_slots=%d (layer-split, shared weights, "
+        "serialized protocol)\n",
+        target_cache_slots_);
+    std::fflush(stdout);
+    return true;
+}
+
+void Qwen35LayerSplitAdapter::swap_live_slot_state(LiveSlotState & slot) {
+    if (slot.caches.size() != shards_.size() ||
+        slot.layer_graphs.size() != shards_.size()) {
+        return;
+    }
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        std::swap(shards_[i].cache, slot.caches[i]);
+        std::swap(shards_[i].layer_graph, slot.layer_graphs[i]);
+    }
+    if (feature_ring_.cap > 0 || slot.feature_ring.cap > 0) {
+        std::swap(feature_ring_, slot.feature_ring);
+    }
+    dflash_target_.reset();
+}
+
+bool Qwen35LayerSplitAdapter::activate_target_cache_slot(int slot_id) {
+    if (slot_id < 0 || slot_id >= target_cache_slots_) return false;
+    if (slot_id == active_slot_) return true;
+
+    if (active_slot_ > 0) {
+        swap_live_slot_state(*extra_slots_[(size_t)active_slot_ - 1]);
+    }
+    active_slot_ = 0;
+    if (slot_id > 0) {
+        swap_live_slot_state(*extra_slots_[(size_t)slot_id - 1]);
+        active_slot_ = slot_id;
+    }
+    return true;
+}
+
+bool Qwen35LayerSplitAdapter::target_cache_slot_busy(int slot_id) const {
+    if (slot_id < 0 || slot_id >= (int)slot_busy_.size()) return false;
+    return slot_busy_[(size_t)slot_id] != 0;
+}
+
+void Qwen35LayerSplitAdapter::set_target_cache_slot_busy(int slot_id, bool busy) {
+    if (slot_id < 0 || slot_id >= (int)slot_busy_.size()) return;
+    slot_busy_[(size_t)slot_id] = busy ? 1 : 0;
+}
+
 void Qwen35LayerSplitAdapter::shutdown() {
     dflash_target_.reset();
 #ifdef DFLASH_HAVE_MMPROJ
@@ -1441,6 +1571,8 @@ void Qwen35LayerSplitAdapter::shutdown() {
         snapshot_free(slot);
     }
     remote_target_shard_.close();
+    (void)activate_target_cache_slot(0);
+    free_extra_live_slots();
     draft_feature_mirror_free(feature_ring_);
     free_draft_weights(draft_weights_);
     prefix_snapshots_.clear();

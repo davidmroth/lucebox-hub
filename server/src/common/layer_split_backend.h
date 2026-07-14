@@ -92,6 +92,15 @@ public:
     virtual int current_last_token() const { return -1; }
     virtual int current_cur_pos() const { return 0; }
 
+    // Live target-cache slots (Phase 2 multi-request on layer-split).
+    virtual int  target_cache_slot_count() const { return 1; }
+    virtual int  active_target_cache_slot() const { return 0; }
+    virtual bool activate_target_cache_slot(int slot_id) {
+        return slot_id == 0;
+    }
+    virtual bool target_cache_slot_busy(int /*slot_id*/) const { return false; }
+    virtual void set_target_cache_slot_busy(int /*slot_id*/, bool /*busy*/) {}
+
     virtual void shutdown() = 0;
 };
 
@@ -138,6 +147,13 @@ public:
     bool supports_remote_draft() const override;
     bool supports_kvflash() const override;
     bool supports_mixed_backend_layer_split() const override;
+
+    int  target_cache_slot_count() const override;
+    int  active_target_cache_slot() const override;
+    bool activate_target_cache_slot(int slot_id) override;
+    bool target_cache_slot_busy(int slot_id) const override;
+    void set_target_cache_slot_busy(int slot_id, bool busy) override;
+    GenerateResult continue_generate(int n_gen, const DaemonIO & io) override;
 
     bool try_handle_command(const std::string & line,
                             const DaemonIO & io) override;

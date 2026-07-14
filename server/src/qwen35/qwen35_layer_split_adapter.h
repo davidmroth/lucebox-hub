@@ -112,11 +112,28 @@ public:
         return use_mixed_target_split();
     }
 
+    int  target_cache_slot_count() const override { return target_cache_slots_; }
+    int  active_target_cache_slot() const override { return active_slot_; }
+    bool activate_target_cache_slot(int slot_id) override;
+    bool target_cache_slot_busy(int slot_id) const override;
+    void set_target_cache_slot_busy(int slot_id, bool busy) override;
+
     void shutdown() override;
 
 private:
+    // Extra live target-cache slots (Phase 2). Slot 0 lives in shards_[].cache
+    // when active_slot_==0; slots 1..N-1 park in extra_slots_.
+    struct LiveSlotState {
+        std::vector<TargetCache> caches;
+        std::vector<StepGraph> layer_graphs;
+        DraftFeatureMirror feature_ring;
+    };
+
     bool load_draft();
     bool init_mixed_target_split();
+    bool allocate_extra_live_slots();
+    void free_extra_live_slots();
+    void swap_live_slot_state(LiveSlotState & slot);
     void kvflash_read_config();
     bool kvflash_attach();
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
@@ -184,6 +201,11 @@ private:
     std::unique_ptr<DFlashTarget> dflash_target_;
     std::vector<float> prefill_last_logits_;
     std::unique_ptr<VisionEncoder> vision_;
+
+    std::vector<std::unique_ptr<LiveSlotState>> extra_slots_;
+    int  target_cache_slots_ = 1;
+    int  active_slot_ = 0;
+    std::vector<char> slot_busy_;
 };
 
 }  // namespace dflash::common

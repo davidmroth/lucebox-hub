@@ -416,6 +416,56 @@ bool LayerSplitBackend::supports_mixed_backend_layer_split() const {
     return adapter_ && adapter_->supports_mixed_backend_layer_split();
 }
 
+int LayerSplitBackend::target_cache_slot_count() const {
+    return adapter_ ? adapter_->target_cache_slot_count() : 1;
+}
+
+int LayerSplitBackend::active_target_cache_slot() const {
+    return adapter_ ? adapter_->active_target_cache_slot() : 0;
+}
+
+bool LayerSplitBackend::activate_target_cache_slot(int slot_id) {
+    return adapter_ && adapter_->activate_target_cache_slot(slot_id);
+}
+
+bool LayerSplitBackend::target_cache_slot_busy(int slot_id) const {
+    return adapter_ && adapter_->target_cache_slot_busy(slot_id);
+}
+
+void LayerSplitBackend::set_target_cache_slot_busy(int slot_id, bool busy) {
+    if (adapter_) adapter_->set_target_cache_slot_busy(slot_id, busy);
+}
+
+GenerateResult LayerSplitBackend::continue_generate(int n_gen, const DaemonIO & io) {
+    GenerateResult result;
+    if (!adapter_) {
+        result.error = "adapter";
+        return result;
+    }
+    if (n_gen <= 0) {
+        result.ok = true;
+        return result;
+    }
+    const int committed = adapter_->current_cur_pos();
+    if (committed <= 0) {
+        result.error = "continue_empty_kv";
+        return result;
+    }
+    const int last_tok = adapter_->current_last_token();
+    if (last_tok < 0) {
+        result.error = "decode_seed";
+        return result;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    const bool ok = adapter_->decode_ar(last_tok, committed, n_gen,
+                                        result.tokens, io);
+    result.decode_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    result.ok = ok;
+    if (!ok) result.error = "decode";
+    return result;
+}
+
 void LayerSplitBackend::shutdown() {
     if (shutdown_done_) return;
     shutdown_done_ = true;
