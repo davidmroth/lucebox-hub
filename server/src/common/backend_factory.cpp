@@ -66,6 +66,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             cfg.run_dflash         = args.draft_path != nullptr;
             cfg.mmproj_path        = args.mmproj_path;
             cfg.mmproj_use_gpu     = args.mmproj_use_gpu;
+            cfg.target_cache_slots = std::max(1, std::min(args.target_cache_slots, 16));
             if (const char * mt = std::getenv("DFLASH_MMPROJ_THREADS")) {
                 cfg.mmproj_threads = std::max(1, std::atoi(mt));
             }

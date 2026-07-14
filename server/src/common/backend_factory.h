@@ -62,6 +62,9 @@ struct BackendArgs {
     // Native mmproj vision (qwen35)
     const char *    mmproj_path     = nullptr;
     bool            mmproj_use_gpu  = true;
+
+    // Phase 2: multi live target-cache slots (layer-split + single-GPU).
+    int             target_cache_slots = 1;
 };
 
 // ─── Factory function ───────────────────────────────────────────────────

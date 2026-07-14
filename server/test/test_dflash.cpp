@@ -289,7 +289,9 @@ static int run_target_layer_split_daemon(
         int max_ctx,
         int max_verify_tokens,
         bool peer_access,
-        int stream_fd) {
+        int stream_fd,
+        int target_cache_slots = 1,
+        bool stream_tagged = false) {
     LayerSplitDaemonConfig cfg;
     cfg.target_path = target_path;
     cfg.draft_path = draft_path;
@@ -305,6 +307,8 @@ static int run_target_layer_split_daemon(
     cfg.kq_stride_pad = g_kq_stride_pad;
     cfg.fa_window = g_fa_window;
     cfg.draft_ctx_max = g_draft_ctx_max;
+    cfg.target_cache_slots = std::max(1, std::min(target_cache_slots, 16));
+    cfg.stream_tagged = stream_tagged;
     return run_layer_split_daemon(cfg);
 }
 
@@ -1126,7 +1130,9 @@ int main(int argc, char ** argv) {
                 lsargs.device.max_ctx,
                 lsargs.max_verify_tokens,
                 lsargs.device.peer_access,
-                lsargs.stream_fd);
+                lsargs.stream_fd,
+                target_cache_slots,
+                stream_tagged);
         }
         if (target_split_dflash && fast_rollback) {
             std::fprintf(stderr,

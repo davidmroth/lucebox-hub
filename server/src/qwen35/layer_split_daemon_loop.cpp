@@ -39,6 +39,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     args.device.backend = PlacementBackend::Cuda;
     args.device.gpu = cfg.target_gpus.front();
     args.draft_device.gpu = cfg.draft_gpu;
+    args.target_cache_slots = std::max(1, std::min(cfg.target_cache_slots, 16));
 
     auto backend = create_backend(args);
     if (!backend) {
@@ -47,9 +48,10 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     }
 
     DaemonLoopArgs dargs;
-    dargs.stream_fd = cfg.stream_fd;
-    dargs.chunk     = 512;
-    dargs.max_ctx   = cfg.max_ctx;
+    dargs.stream_fd     = cfg.stream_fd;
+    dargs.chunk         = 512;
+    dargs.max_ctx       = cfg.max_ctx;
+    dargs.stream_tagged = cfg.stream_tagged;
 
     const int rc = run_daemon(*backend, dargs);
     backend->shutdown();
