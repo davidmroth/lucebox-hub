@@ -57,7 +57,13 @@ bool run_layer_split_ar_decode(
         if (is_eos(last_tok)) break;
     }
 
-    io.emit(-1);
+    // Quantum budget exhaustion is NOT stream termination. Multi-request SCHED
+    // emits CONTINUE/DONE from finalize_live_quantum / RESTORE_CHAIN admit.
+    // Emitting DONE here after each AR quantum made demux stop after roughly
+    // Q1(dflash, no trailing DONE) + Q2(AR, DONE) ≈ 16 tokens in WebUI.
+    if (io.cancelled || is_eos(last_tok)) {
+        io.emit(-1);
+    }
     return true;
 }
 
