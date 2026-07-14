@@ -4,15 +4,18 @@
 // operations are dispatched through the ModelBackend interface.
 
 #include "daemon_loop.h"
+#include "daemon_scheduler.h"
 
 #include "sampler.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -42,13 +45,30 @@ void DaemonIO::emit(int32_t v) const {
     }
 
     if (stream_fd < 0) return;
+
+    auto write_i32 = [this](int32_t x) {
 #ifndef _WIN32
-    ssize_t n = ::write(stream_fd, &v, sizeof(v));
-    (void)n;
+        ssize_t n = ::write(stream_fd, &x, sizeof(x));
+        (void)n;
 #else
-    _write(stream_fd, &v, sizeof(v));
+        _write(stream_fd, &x, sizeof(x));
 #endif
+    };
+
+    // Tagged framing: [-2, request_id, token_or_sentinel]
+    if (stream_tagged && (v >= 0 || v == -1 || v == -4)) {
+        write_i32(-2);
+        write_i32(request_id);
+        write_i32(v);
+        return;
+    }
+
+    write_i32(v);
 }
+
+void DaemonIO::emit_done() const { emit(-1); }
+
+void DaemonIO::emit_continue() const { emit(-4); }
 
 DaemonIO DaemonIO::with_token_callback(const TokenCallback & cb) const {
     DaemonIO out = *this;
@@ -242,15 +262,291 @@ static void parse_inline_snap(const std::string & line,
 
 int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
 
+    // Pipe-backed stdio (server_tools / smoke) is fully buffered by default;
+    // force line buffering so ready banners and ack lines arrive promptly.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IOLBF, 0);
+
     DaemonIO io;
     io.stream_fd = args.stream_fd;
+    io.stream_tagged = args.stream_tagged;
+
+    const int n_slots = std::max(1, backend.target_cache_slot_count());
+    std::vector<LiveRequestState> requests((size_t)n_slots);
+    std::deque<PendingQuantum> pending_quanta;
+    size_t scheduler_cursor = 0;
+    int current_req_id = 0;
+    int current_slot = backend.active_target_cache_slot();
+
+    auto sync_io_ids = [&]() {
+        io.request_id = current_req_id;
+    };
+    sync_io_ids();
+
+    auto require_stream_tagged = [&](const char * label) -> bool {
+        if (args.stream_tagged) return true;
+        std::fprintf(stderr, "[scheduler] %s requires --stream-tagged\n", label);
+        std::printf("err stream_tagged_required\n");
+        std::fflush(stdout);
+        return false;
+    };
+
+    auto parse_req_slot_prefix = [&](std::string & cmd) {
+        // Optional leading "REQ <id>" / "REQUEST <id>" and/or "SLOT <id>".
+        for (;;) {
+            while (!cmd.empty() && std::isspace((unsigned char)cmd[0])) {
+                cmd.erase(cmd.begin());
+            }
+            if (starts_with(cmd, "REQ ") || starts_with(cmd, "REQUEST ")) {
+                const size_t skip = starts_with(cmd, "REQUEST ") ? 8 : 4;
+                size_t p = skip;
+                while (p < cmd.size() && std::isspace((unsigned char)cmd[p])) ++p;
+                current_req_id = std::atoi(cmd.c_str() + (int)p);
+                while (p < cmd.size() && !std::isspace((unsigned char)cmd[p])) ++p;
+                cmd = cmd.substr(p);
+                sync_io_ids();
+                continue;
+            }
+            if (starts_with(cmd, "SLOT ")) {
+                size_t p = 5;
+                while (p < cmd.size() && std::isspace((unsigned char)cmd[p])) ++p;
+                const int sid = std::atoi(cmd.c_str() + (int)p);
+                while (p < cmd.size() && !std::isspace((unsigned char)cmd[p])) ++p;
+                cmd = cmd.substr(p);
+                if (!backend.activate_target_cache_slot(sid)) {
+                    std::fprintf(stderr, "[scheduler] bad SLOT %d (slots=%d)\n",
+                                 sid, n_slots);
+                    std::printf("err bad_slot\n");
+                    std::fflush(stdout);
+                    cmd.clear();
+                    return false;
+                }
+                current_slot = sid;
+                continue;
+            }
+            break;
+        }
+        return true;
+    };
+
+    auto run_one_quantum = [&](PendingQuantum q) -> bool {
+        if (q.slot_id < 0 || q.slot_id >= n_slots) return false;
+        LiveRequestState & req = requests[(size_t)q.slot_id];
+        if (!req.active || req.request_id != q.request_id || req.epoch != q.epoch) {
+            return false;
+        }
+        if (!backend.activate_target_cache_slot(q.slot_id)) return false;
+        current_slot = q.slot_id;
+        current_req_id = q.request_id;
+        sync_io_ids();
+
+        GenerateResult r = backend.continue_generate(q.n_gen, io);
+        const int produced = (int)r.tokens.size();
+        req.emitted += produced;
+        req.remaining = std::max(0, req.remaining - produced);
+        if (!r.ok || req.remaining <= 0 || io.cancelled) {
+            req.active = false;
+            req.remaining = 0;
+            backend.set_target_cache_slot_busy(q.slot_id, false);
+            io.emit_done();
+        } else {
+            io.emit_continue();
+        }
+        return true;
+    };
 
     backend.print_ready_banner();
+    if (n_slots > 1) {
+        std::printf("[daemon] target_cache_slots=%d (shared weights, serialized protocol)%s\n",
+                    n_slots, args.stream_tagged ? " stream_tagged=1" : "");
+    }
+    // Always flush: when stdin/stdout are pipes (Python smoke / server_tools),
+    // stdout is fully buffered and the ready banner otherwise never arrives.
     std::fflush(stdout);
 
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line == "quit" || line == "exit") break;
+
+        if (!parse_req_slot_prefix(line)) continue;
+        if (line.empty()) continue;
+
+        // ── Multi-request scheduler commands ─────────────────────────
+
+        if (line == "LIST_TARGET_CACHE_SLOTS") {
+            std::printf("[daemon] target_cache_slots=%d active=%d\n",
+                        n_slots, backend.active_target_cache_slot());
+            std::fflush(stdout);
+            continue;
+        }
+        if (line == "LIST_REQUESTS") {
+            std::printf("[scheduler] requests=");
+            bool first = true;
+            for (const auto & req : requests) {
+                if (!req.active) continue;
+                std::printf("%s%d@slot%d(rem=%d,q=%d)",
+                            first ? "" : ",",
+                            req.request_id, req.slot_id, req.remaining, req.quantum);
+                first = false;
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (starts_with(line, "CANCEL") ||
+            (starts_with(line, "REQ ") && line.find(" CANCEL") != std::string::npos)) {
+            int cancel_id = current_req_id;
+            if (starts_with(line, "CANCEL ")) {
+                cancel_id = std::atoi(line.c_str() + 7);
+            }
+            for (auto & req : requests) {
+                if (req.active && req.request_id == cancel_id) {
+                    req.active = false;
+                    req.remaining = 0;
+                    req.epoch += 1;
+                    backend.set_target_cache_slot_busy(req.slot_id, false);
+                    std::printf("[scheduler] cancelled req=%d slot=%d\n",
+                                cancel_id, req.slot_id);
+                    std::fflush(stdout);
+                }
+            }
+            continue;
+        }
+        if (starts_with(line, "START ") || line == "CONTINUE" || starts_with(line, "CONT ")) {
+            if (!require_stream_tagged(starts_with(line, "START") ? "START" : "CONTINUE")) {
+                continue;
+            }
+            if (starts_with(line, "START ")) {
+                // START <prompt_path> <total_gen> <quantum>
+                char path[1024];
+                int total_gen = 0, quantum = 0;
+                if (std::sscanf(line.c_str() + 6, "%1023s %d %d",
+                                path, &total_gen, &quantum) < 2 ||
+                    total_gen <= 0) {
+                    std::printf("err bad_args\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (quantum <= 0) quantum = total_gen;
+                // Admit onto current_slot if free, else first free slot.
+                int slot = current_slot;
+                if (slot < 0 || slot >= n_slots || requests[(size_t)slot].active) {
+                    slot = -1;
+                    for (int s = 0; s < n_slots; ++s) {
+                        if (!requests[(size_t)s].active) { slot = s; break; }
+                    }
+                }
+                if (slot < 0) {
+                    std::fprintf(stderr, "[scheduler] no free target cache slots\n");
+                    std::printf("err no_free_slot\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (!backend.activate_target_cache_slot(slot)) {
+                    std::printf("err bad_slot\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                current_slot = slot;
+                // Prefill + first quantum via normal generate on empty prompt path.
+                // Read prompt ids (length-prefixed or raw handled by generate file path).
+                // Use bare-prompt generate through restore_and_generate isn't right —
+                // use standard GenerateRequest via a small local helper: load file + generate.
+                std::ifstream in(path, std::ios::binary);
+                if (!in) {
+                    std::printf("err bad_prompt\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                in.seekg(0, std::ios::end);
+                const std::streamoff nbytes = in.tellg();
+                in.seekg(0, std::ios::beg);
+                if (nbytes <= 0 || (nbytes % 4) != 0) {
+                    std::printf("err bad_prompt\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                std::vector<int32_t> ids((size_t)nbytes / 4);
+                in.read(reinterpret_cast<char *>(ids.data()), nbytes);
+                GenerateRequest greq;
+                greq.prompt = std::move(ids);
+                greq.n_gen = quantum;
+                greq.stream = true;
+                sync_io_ids();
+                GenerateResult gr = backend.generate(greq, io);
+                LiveRequestState & req = requests[(size_t)slot];
+                req.active = true;
+                req.request_id = current_req_id;
+                req.slot_id = slot;
+                req.quantum = quantum;
+                req.emitted = (int)gr.tokens.size();
+                req.remaining = std::max(0, total_gen - req.emitted);
+                req.epoch += 1;
+                backend.set_target_cache_slot_busy(slot, true);
+                if (!gr.ok || req.remaining <= 0 || io.cancelled) {
+                    req.active = false;
+                    req.remaining = 0;
+                    backend.set_target_cache_slot_busy(slot, false);
+                    io.emit_done();
+                } else {
+                    io.emit_continue();
+                }
+                std::printf("ok START req=%d slot=%d emitted=%d remaining=%d\n",
+                            current_req_id, slot, req.emitted, req.remaining);
+                std::fflush(stdout);
+                continue;
+            }
+            // CONTINUE / CONT — keep decoding on current slot's active request
+            int slot = current_slot;
+            if (slot < 0 || slot >= n_slots || !requests[(size_t)slot].active) {
+                std::printf("err no_active_request\n");
+                std::fflush(stdout);
+                continue;
+            }
+            LiveRequestState & req = requests[(size_t)slot];
+            const int q = std::max(1, std::min(req.quantum > 0 ? req.quantum : req.remaining,
+                                               req.remaining));
+            PendingQuantum pq{req.request_id, req.slot_id, req.epoch, q};
+            run_one_quantum(pq);
+            continue;
+        }
+        if (line == "SCHED_STEP") {
+            if (!require_stream_tagged("SCHED_STEP")) continue;
+            if (pending_quanta.empty()) {
+                enqueue_next_quantum(requests, pending_quanta, scheduler_cursor);
+            }
+            if (pending_quanta.empty()) {
+                std::printf("ok SCHED_STEP idle\n");
+                std::fflush(stdout);
+                continue;
+            }
+            PendingQuantum q = pending_quanta.front();
+            pending_quanta.pop_front();
+            run_one_quantum(q);
+            enqueue_next_quantum(requests, pending_quanta, scheduler_cursor);
+            std::printf("ok SCHED_STEP\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (line == "SCHED_DRAIN") {
+            if (!require_stream_tagged("SCHED_DRAIN")) continue;
+            int steps = 0;
+            while (true) {
+                if (pending_quanta.empty()) {
+                    if (!enqueue_next_quantum(requests, pending_quanta, scheduler_cursor)) {
+                        break;
+                    }
+                }
+                PendingQuantum q = pending_quanta.front();
+                pending_quanta.pop_front();
+                run_one_quantum(q);
+                ++steps;
+                enqueue_next_quantum(requests, pending_quanta, scheduler_cursor);
+            }
+            std::printf("ok SCHED_DRAIN steps=%d\n", steps);
+            std::fflush(stdout);
+            continue;
+        }
 
         // ── Lifecycle commands (no sampler tail) ─────────────────────
 
@@ -377,6 +673,14 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
 
         // ── RESTORE_CHAIN <thick> <thin_list> <prompt_path> <n_gen> ─
         if (cmd == "RESTORE_CHAIN") {
+            if (backend.target_cache_slot_busy(backend.active_target_cache_slot())) {
+                std::fprintf(stderr,
+                    "[scheduler] RESTORE_CHAIN refused: active slot busy\n");
+                std::printf("err slot_busy\n");
+                std::fflush(stdout);
+                io.emit(-1);
+                continue;
+            }
             int thick_slot = -2;
             std::string thin_str;
             std::string in_path;

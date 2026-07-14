@@ -72,6 +72,10 @@ struct Qwen35Config {
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
 
+    // Phase 1: concurrent live target-cache slots (single-GPU daemon).
+    // N=1 keeps legacy behavior. Extra slots share weights; only KV/SSM.
+    int          target_cache_slots = 1;
+
     // Native mmproj vision
     const char * mmproj_path    = nullptr;
     bool         mmproj_use_gpu = true;
@@ -128,6 +132,14 @@ public:
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
+    bool supports_multimodal() const override { return vision_ != nullptr; }
+
+    int  target_cache_slot_count() const override { return target_cache_slots_; }
+    int  active_target_cache_slot() const override { return active_slot_; }
+    bool activate_target_cache_slot(int slot_id) override;
+    bool target_cache_slot_busy(int slot_id) const override;
+    void set_target_cache_slot_busy(int slot_id, bool busy) override;
+    GenerateResult continue_generate(int n_gen, const DaemonIO & io) override;
 
     void shutdown() override;
 
@@ -233,6 +245,23 @@ private:
     TargetWeights  w_;
     DraftWeights   dw_;
     TargetCache    cache_;
+
+    // Extra live target-cache slots (Phase 1). Slot 0 is `cache_`/`sg_`/…
+    // when active_slot_==0; slots 1..N-1 park in extra_slots_.
+    struct LiveSlotState {
+        TargetCache cache;
+        StepGraph sg;
+        StepGraph draft_sg;
+        StepGraph proj_sg;
+        DraftFeatureMirror feature_mirror;
+        bool busy = false;
+    };
+    std::vector<std::unique_ptr<LiveSlotState>> extra_slots_;
+    int  target_cache_slots_ = 1;
+    int  active_slot_ = 0;
+    std::vector<char> slot_busy_;  // size N; slot 0 also mirrors primary
+
+    void swap_live_slot_state(LiveSlotState & slot);
 
     // ── Graph containers (persistent gallocr buffers) ────────────────
     StepGraph      sg_;           // target forward (verify / prefill)

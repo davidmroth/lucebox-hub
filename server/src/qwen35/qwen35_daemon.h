@@ -34,6 +34,8 @@ struct Qwen35DaemonArgs {
     float        ddtree_temp       = 1.0f;
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
+    int          target_cache_slots = 1;
+    bool         stream_tagged = false;
 };
 
 // Run the qwen35 daemon loop. Returns 0 on clean exit, 1 on init failure.

@@ -648,6 +648,11 @@ static int run_target_layer_split_harness(
 // ─── Main ─────────────────────────────────────────────────────────
 
 int main(int argc, char ** argv) {
+    // Pipe-backed stdio from Python is fully buffered; enable line buffering
+    // before any printf so ready banners and ack lines flush promptly.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IOLBF, 0);
+
     if (argc >= 2 && std::strcmp(argv[1], "--draft-ipc-daemon") == 0) {
         if (argc < 3) {
             std::fprintf(stderr,
@@ -796,6 +801,8 @@ int main(int argc, char ** argv) {
     }
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
+    int   target_cache_slots = 1;
+    bool  stream_tagged = false;
     for (int i = flags_start; i < argc; i++) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
@@ -901,6 +908,19 @@ int main(int argc, char ** argv) {
         }
         else if (std::strncmp(argv[i], "--max-ctx=", 10) == 0) {
             g_max_ctx_override = std::atoi(argv[i] + 10);
+        }
+        else if (std::strncmp(argv[i], "--target-cache-slots=", 21) == 0) {
+            target_cache_slots = std::atoi(argv[i] + 21);
+        }
+        else if (std::strncmp(argv[i], "--cache-slots=", 14) == 0) {
+            target_cache_slots = std::atoi(argv[i] + 14);
+        }
+        else if (std::strcmp(argv[i], "--target-cache-slots") == 0 ||
+                 std::strcmp(argv[i], "--cache-slots") == 0) {
+            if (i + 1 < argc) target_cache_slots = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--stream-tagged") == 0) {
+            stream_tagged = true;
         }
         // KV cache type flags (mirror llama-cli -ctk / -ctv).
         // Set the env var before resolve_kv_types() reads it inside create_target_cache.
@@ -1165,6 +1185,8 @@ int main(int argc, char ** argv) {
         qargs.ddtree_temp       = ddtree_temp;
         qargs.ddtree_chain_seed = ddtree_chain_seed;
         qargs.use_feature_mirror = draft_feature_mirror;
+        qargs.target_cache_slots = std::max(1, std::min(target_cache_slots, 16));
+        qargs.stream_tagged = stream_tagged;
         if (detected_arch == "qwen35moe") {
             std::fprintf(stderr,
                 "[test_dflash] arch=qwen35moe daemon -> dispatching to run_qwen35moe_daemon "

@@ -285,6 +285,32 @@ bool Qwen35Backend::init() {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
+
+    target_cache_slots_ = std::max(1, std::min(cfg_.target_cache_slots, 16));
+    active_slot_ = 0;
+    slot_busy_.assign((size_t)target_cache_slots_, 0);
+    if (target_cache_slots_ > 1) {
+        extra_slots_.reserve((size_t)target_cache_slots_ - 1);
+        for (int sid = 1; sid < target_cache_slots_; ++sid) {
+            auto slot = std::make_unique<LiveSlotState>();
+            if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens,
+                                     target_backend_, slot->cache,
+                                     /*prefill_only=*/true,
+                                     /*ctx_alloc=*/kvflash_tokens_)) {
+                std::fprintf(stderr, "cache slot %d: %s\n", sid, dflash27b_last_error());
+                for (auto & allocated : extra_slots_) {
+                    free_target_cache(allocated->cache);
+                }
+                extra_slots_.clear();
+                free_target_cache(cache_);
+                return false;
+            }
+            extra_slots_.push_back(std::move(slot));
+        }
+        std::printf("[daemon] target_cache_slots=%d (shared weights, serialized protocol)\n",
+                    target_cache_slots_);
+    }
+
     if (kvflash_active()) {
         KvFlashConfig pc;
         pc.pool_tokens = kvflash_tokens_;
@@ -735,9 +761,71 @@ DFlashTarget * Qwen35Backend::dflash_target() {
     return dflash_target_.get();
 }
 
+void Qwen35Backend::swap_live_slot_state(LiveSlotState & slot) {
+    std::swap(cache_, slot.cache);
+    std::swap(sg_, slot.sg);
+    std::swap(draft_sg_, slot.draft_sg);
+    std::swap(proj_sg_, slot.proj_sg);
+    std::swap(feature_mirror_, slot.feature_mirror);
+    dflash_target_.reset();
+}
+
+bool Qwen35Backend::activate_target_cache_slot(int slot_id) {
+    if (slot_id < 0 || slot_id >= target_cache_slots_) return false;
+    if (slot_id == active_slot_) return true;
+
+    // Park current working set back into its storage (slot 0 lives in
+    // primary when inactive; extras 1..N-1 live in extra_slots_).
+    if (active_slot_ > 0) {
+        swap_live_slot_state(*extra_slots_[(size_t)active_slot_ - 1]);
+    }
+    active_slot_ = 0;
+    if (slot_id > 0) {
+        swap_live_slot_state(*extra_slots_[(size_t)slot_id - 1]);
+        active_slot_ = slot_id;
+    }
+    return true;
+}
+
+bool Qwen35Backend::target_cache_slot_busy(int slot_id) const {
+    if (slot_id < 0 || slot_id >= (int)slot_busy_.size()) return false;
+    return slot_busy_[(size_t)slot_id] != 0;
+}
+
+void Qwen35Backend::set_target_cache_slot_busy(int slot_id, bool busy) {
+    if (slot_id < 0 || slot_id >= (int)slot_busy_.size()) return;
+    slot_busy_[(size_t)slot_id] = busy ? 1 : 0;
+}
+
+GenerateResult Qwen35Backend::continue_generate(int n_gen, const DaemonIO & io) {
+    GenerateResult result;
+    if (n_gen <= 0) {
+        result.ok = true;
+        return result;
+    }
+    if (cache_.cur_pos <= 0) {
+        result.error = "continue_empty_kv";
+        return result;
+    }
+    const int committed = cache_.cur_pos;
+    std::vector<int32_t> out_tokens;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = do_ar_decode(committed, n_gen, out_tokens, io);
+    const auto t1 = std::chrono::steady_clock::now();
+    result.ok = ok;
+    result.tokens = std::move(out_tokens);
+    result.decode_s = std::chrono::duration<double>(t1 - t0).count();
+    if (!ok) result.error = "decode";
+    return result;
+}
+
 // ── Shutdown ────────────────────────────────────────────────────────────
 
 void Qwen35Backend::shutdown() {
+    // Restore slot 0 into the primary working set so teardown of cache_/sg_
+    // frees the right resources; then free parked extras.
+    (void)activate_target_cache_slot(0);
+
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     free_drafter();
     step_graph_destroy(sg_);
@@ -751,6 +839,15 @@ void Qwen35Backend::shutdown() {
     if (!target_parked_) free_target_weights(w_);
     if (!use_remote_draft && !draft_parked_) free_draft_weights(dw_);
     free_target_cache(cache_);
+    for (auto & slot : extra_slots_) {
+        if (!slot) continue;
+        step_graph_destroy(slot->sg);
+        step_graph_destroy(slot->draft_sg);
+        step_graph_destroy(slot->proj_sg);
+        draft_feature_mirror_free(slot->feature_mirror);
+        free_target_cache(slot->cache);
+    }
+    extra_slots_.clear();
     if (split_gpus_ && draft_backend_) {
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;

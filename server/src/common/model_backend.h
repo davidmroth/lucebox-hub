@@ -42,6 +42,12 @@ using InferenceObserver = std::function<void(const char * phase,
 struct DaemonIO {
     int stream_fd = -1;
 
+    // When true, emit tokens as tagged frames: [-2, request_id, token].
+    // Sentinels: -4 = CONTINUE (more work), -1 = DONE. Default off preserves
+    // legacy bare int32 streaming for Python.
+    bool stream_tagged = false;
+    int  request_id = 0;
+
     // Optional token callback. When set, emit() calls this for each token
     // (excluding the -1 sentinel). If it returns false, the `cancelled`
     // flag is set and the caller should abort generation.
@@ -56,6 +62,10 @@ struct DaemonIO {
     // Also invokes on_token if set. Sets cancelled=true if on_token
     // returns false (client disconnected).
     void emit(int32_t v) const;
+
+    // Emit DONE (-1) or CONTINUE (-4), respecting stream_tagged framing.
+    void emit_done() const;
+    void emit_continue() const;
 
     // Return an IO handle that also invokes `cb` for emitted tokens.
     DaemonIO with_token_callback(const TokenCallback & cb) const;
@@ -391,11 +401,36 @@ struct ModelBackend {
     // growth over time. Default is a no-op.
     virtual void release_scratch() {}
 
+    // ── Live target-cache slots (Phase 1 multi-request) ───────────────
+    // Distinct from PrefixSnapshot slots. Default: single live cache.
+    virtual int  target_cache_slot_count() const { return 1; }
+    virtual int  active_target_cache_slot() const { return 0; }
+    virtual bool activate_target_cache_slot(int slot_id) {
+        return slot_id == 0;
+    }
+    // True if a scheduler request currently owns the slot (RESTORE_CHAIN
+    // must refuse to overwrite). Default: never busy.
+    virtual bool target_cache_slot_busy(int /*slot_id*/) const { return false; }
+    virtual void set_target_cache_slot_busy(int /*slot_id*/, bool /*busy*/) {}
+
+    // Decode more tokens from the already-prefilling live KV (CONTINUE).
+    // Default returns failure; Qwen35Backend implements it.
+    virtual GenerateResult continue_generate(int n_gen, const DaemonIO & io) {
+        (void)n_gen; (void)io;
+        GenerateResult r;
+        r.ok = false;
+        r.error = "continue_generate not supported";
+        return r;
+    }
+
     // Return true when the backend can route draft execution through the
     // common remote-draft IPC transport. Model families that do not implement
     // the DFlash feature boundary keep the default false and are rejected by
     // the server before startup.
     virtual bool supports_remote_draft() const { return false; }
+
+    // Native mmproj vision. LayerSplitBackend overrides to proxy the adapter.
+    virtual bool supports_multimodal() const { return false; }
 
     // Layer-split capability introspection. Non layer-split backends keep the
     // default false; LayerSplitBackend proxies model-adapter support.
