@@ -345,6 +345,33 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
         return true;
     };
 
+    auto finalize_live_quantum = [&](LiveRequestState & req, int produced,
+                                      int requested, bool ok,
+                                      int last_emitted_tok) {
+        // `requested` is the n_gen asked of this quantum. Fewer tokens than
+        // requested, or an EOS at/ending the quantum, means stop — clear
+        // remaining so SCHED_DRAIN cannot re-seed on an EOS last-token and
+        // burn the leftover max_tokens budget.
+        req.emitted += produced;
+        const bool hit_eos =
+            last_emitted_tok >= 0 && backend.token_is_eos(last_emitted_tok);
+        const bool early_stop =
+            !ok || produced <= 0 || produced < requested || hit_eos;
+        if (early_stop) {
+            req.remaining = 0;
+        } else {
+            req.remaining = std::max(0, req.remaining - produced);
+        }
+        if (req.remaining <= 0 || io.cancelled) {
+            req.active = false;
+            req.remaining = 0;
+            backend.set_target_cache_slot_busy(req.slot_id, false);
+            io.emit_done();
+        } else {
+            io.emit_continue();
+        }
+    };
+
     auto run_one_quantum = [&](PendingQuantum q) -> bool {
         if (q.slot_id < 0 || q.slot_id >= n_slots) return false;
         LiveRequestState & req = requests[(size_t)q.slot_id];
@@ -358,16 +385,9 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
 
         GenerateResult r = backend.continue_generate(q.n_gen, io);
         const int produced = (int)r.tokens.size();
-        req.emitted += produced;
-        req.remaining = std::max(0, req.remaining - produced);
-        if (!r.ok || req.remaining <= 0 || io.cancelled) {
-            req.active = false;
-            req.remaining = 0;
-            backend.set_target_cache_slot_busy(q.slot_id, false);
-            io.emit_done();
-        } else {
-            io.emit_continue();
-        }
+        const int last_tok =
+            produced > 0 ? (int)r.tokens.back() : -1;
+        finalize_live_quantum(req, produced, q.n_gen, r.ok, last_tok);
         return true;
     };
 
@@ -500,13 +520,25 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 req.remaining = std::max(0, total_gen - req.emitted);
                 req.epoch += 1;
                 backend.set_target_cache_slot_busy(slot, true);
-                if (!gr.ok || req.remaining <= 0 || io.cancelled) {
-                    req.active = false;
-                    req.remaining = 0;
-                    backend.set_target_cache_slot_busy(slot, false);
-                    io.emit_done();
-                } else {
-                    io.emit_continue();
+                {
+                    const int produced = (int)gr.tokens.size();
+                    const int last_tok =
+                        produced > 0 ? (int)gr.tokens.back() : -1;
+                    const bool hit_eos =
+                        last_tok >= 0 && backend.token_is_eos(last_tok);
+                    const bool early_stop =
+                        !gr.ok || produced <= 0 || produced < quantum || hit_eos;
+                    if (early_stop) {
+                        req.remaining = 0;
+                    }
+                    if (req.remaining <= 0 || io.cancelled) {
+                        req.active = false;
+                        req.remaining = 0;
+                        backend.set_target_cache_slot_busy(slot, false);
+                        io.emit_done();
+                    } else {
+                        io.emit_continue();
+                    }
                 }
                 std::printf("ok START req=%d slot=%d emitted=%d remaining=%d\n",
                             current_req_id, slot, req.emitted, req.remaining);
@@ -835,18 +867,36 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 lreq.request_id = current_req_id;
                 lreq.slot_id = restore_live_slot;
                 lreq.quantum = quantum;
-                lreq.emitted = (int)result.tokens.size();
-                lreq.remaining = std::max(0, n_gen - lreq.emitted);
+                lreq.emitted = 0;
+                // Remaining budget after this quantum (may be cleared on early stop).
+                lreq.remaining = std::max(0, n_gen - (int)result.tokens.size());
                 lreq.epoch += 1;
                 current_slot = restore_live_slot;
                 backend.set_target_cache_slot_busy(restore_live_slot, true);
-                if (!result.ok || lreq.remaining <= 0 || io.cancelled) {
-                    lreq.active = false;
-                    lreq.remaining = 0;
-                    backend.set_target_cache_slot_busy(restore_live_slot, false);
-                    io.emit_done();
-                } else {
-                    io.emit_continue();
+                // Pass remaining_delta semantics via a dedicated admit finalize:
+                // emitted was 0; produced already subtracted from remaining above;
+                // only force remaining=0 on early stop, then emit CONTINUE/DONE.
+                {
+                    const int produced = (int)result.tokens.size();
+                    const int last_tok =
+                        produced > 0 ? (int)result.tokens.back() : -1;
+                    lreq.emitted = produced;
+                    const bool hit_eos =
+                        last_tok >= 0 && backend.token_is_eos(last_tok);
+                    const bool early_stop =
+                        !result.ok || produced <= 0 || produced < first_gen ||
+                        hit_eos;
+                    if (early_stop) {
+                        lreq.remaining = 0;
+                    }
+                    if (lreq.remaining <= 0 || io.cancelled) {
+                        lreq.active = false;
+                        lreq.remaining = 0;
+                        backend.set_target_cache_slot_busy(restore_live_slot, false);
+                        io.emit_done();
+                    } else {
+                        io.emit_continue();
+                    }
                 }
                 std::printf(
                     "ok RESTORE_CHAIN_ADMIT req=%d slot=%d emitted=%d remaining=%d "

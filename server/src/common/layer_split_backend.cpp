@@ -460,6 +460,10 @@ void LayerSplitBackend::set_target_cache_slot_busy(int slot_id, bool busy) {
     if (adapter_) adapter_->set_target_cache_slot_busy(slot_id, busy);
 }
 
+bool LayerSplitBackend::token_is_eos(int tok) const {
+    return adapter_ && adapter_->token_is_eos(tok);
+}
+
 GenerateResult LayerSplitBackend::continue_generate(int n_gen, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_) {
@@ -478,6 +482,12 @@ GenerateResult LayerSplitBackend::continue_generate(int n_gen, const DaemonIO & 
     const int last_tok = adapter_->current_last_token();
     if (last_tok < 0) {
         result.error = "decode_seed";
+        return result;
+    }
+    // Already finished: do not re-emit the EOS seed as a "new" token (that
+    // made SCHED_DRAIN burn remaining one EOS echo per step).
+    if (adapter_->token_is_eos(last_tok)) {
+        result.ok = true;
         return result;
     }
     auto t0 = std::chrono::steady_clock::now();

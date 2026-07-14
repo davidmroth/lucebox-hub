@@ -1296,6 +1296,11 @@ int Qwen35LayerSplitAdapter::current_cur_pos() const {
     return shards_.front().cache.cur_pos;
 }
 
+bool Qwen35LayerSplitAdapter::token_is_eos(int tok) const {
+    if (shards_.empty()) return false;
+    return is_eos_tok(tok, shards_.front().weights);
+}
+
 bool Qwen35LayerSplitAdapter::decode_ar(
         int last_tok, int committed, int n_gen,
         std::vector<int32_t> & out_tokens,

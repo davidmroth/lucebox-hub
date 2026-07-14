@@ -91,6 +91,10 @@ public:
     }
     virtual int current_last_token() const { return -1; }
     virtual int current_cur_pos() const { return 0; }
+    virtual bool token_is_eos(int tok) const {
+        (void)tok;
+        return false;
+    }
 
     // Live target-cache slots (Phase 2 multi-request on layer-split).
     virtual int  target_cache_slot_count() const { return 1; }
@@ -153,6 +157,7 @@ public:
     bool activate_target_cache_slot(int slot_id) override;
     bool target_cache_slot_busy(int slot_id) const override;
     void set_target_cache_slot_busy(int slot_id, bool busy) override;
+    bool token_is_eos(int tok) const override;
     GenerateResult continue_generate(int n_gen, const DaemonIO & io) override;
 
     bool try_handle_command(const std::string & line,

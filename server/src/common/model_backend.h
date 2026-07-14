@@ -417,6 +417,10 @@ struct ModelBackend {
     // must refuse to overwrite). Default: never busy.
     virtual bool target_cache_slot_busy(int /*slot_id*/) const { return false; }
     virtual void set_target_cache_slot_busy(int /*slot_id*/, bool /*busy*/) {}
+    virtual bool token_is_eos(int tok) const {
+        (void)tok;
+        return false;
+    }
 
     // Decode more tokens from the already-prefilling live KV (CONTINUE).
     // Default returns failure; Qwen35Backend implements it.

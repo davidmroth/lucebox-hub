@@ -103,6 +103,7 @@ public:
                         int32_t last_tok) override;
     int current_last_token() const override;
     int current_cur_pos() const override;
+    bool token_is_eos(int tok) const override;
 
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
