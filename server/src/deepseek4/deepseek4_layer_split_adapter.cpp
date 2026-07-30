@@ -599,7 +599,8 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
         int n_gen,
         const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
-        const DaemonIO & io) {
+        const DaemonIO & io,
+        bool seed_already_streamed) {
     if (shards_.empty()) return false;
 
     const DeepSeek4Weights & w = shards_[0].weights;
@@ -620,7 +621,8 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
         last_tok_in, committed, n_gen, vocab,
         prefill_last_logits_, sampler_, sampler_rng_,
         history_prefix,
-        forward_one, is_eos, out_tokens, io);
+        forward_one, is_eos, out_tokens, io,
+        seed_already_streamed);
 }
 
 bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {

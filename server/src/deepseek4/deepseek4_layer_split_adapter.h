@@ -55,7 +55,8 @@ public:
     bool decode_ar(int last_tok, int committed, int n_gen,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
-                   const DaemonIO & io) override;
+                   const DaemonIO & io,
+                   bool seed_already_streamed = false) override;
     bool supports_cpu_sampling() const override { return true; }
     bool supports_mixed_backend_layer_split() const override {
         return use_mixed_target_split();
