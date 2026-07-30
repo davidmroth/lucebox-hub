@@ -2627,8 +2627,10 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool decode_ar(int last_tok, int committed, int n_gen,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
-                   const DaemonIO & io) override {
+                   const DaemonIO & io,
+                   bool seed_already_streamed = false) override {
         (void)history_prefix;
+        (void)seed_already_streamed;
         TEST_ASSERT(committed == current_pos);
         for (int i = 0; i < n_gen; ++i) {
             int32_t tok = last_tok + i + 1;
